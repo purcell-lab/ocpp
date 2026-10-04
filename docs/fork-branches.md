@@ -13,6 +13,7 @@ for HACS and is the only branch that carries fork-only changes.
 | `fix/v16-preserve-measurand-list` | A charger that cannot report measurands (`MeterValuesSampledData` unknown) no longer blanks the configured list; `post_connect` no longer mutates `entry.data` in place. Note: genuine changes are now saved, so a mismatched entry reloads once. | lbbrhzn/ocpp#1760 |
 | `fix/restore-metrics-in-native-unit` | Meter Start restored after a restart is converted from the HA display unit (e.g. MWh) instead of being read as kWh. | new issue |
 | `fix/v16-stop-after-finishing` | A session lost across an HA restart is still matched to its StopTransaction from the persisted transaction store; connector 0 no longer shadows connector 1 on the flat Transaction Id sensor. The live failure that prompted it is not fully explained yet: confirm with debug logging on the next remote stop. | new issue |
+| `fix/device-registry-deprecations` | Devices linked with `via_device_id` instead of the deprecated `via_device` tuple (breaks in HA 2027.8); `update()` no longer reads `device_registry.devices` as a mapping (breaks in 2027.9). | new issue (purcell-lab/ocpp#2) |
 | `feat/measurand-context-source` | `context_source: charger / defaulted` next to every published `context`. | new issue |
 
 ## Stacked V2G export series (merge in this order)
