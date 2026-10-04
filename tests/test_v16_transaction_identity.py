@@ -42,6 +42,7 @@ from custom_components.ocpp.const import (
 from custom_components.ocpp.enums import (
     ConfigurationKey as ckey,
     HAChargerSession as csess,
+    HAChargerStatuses as cstat,
     OcppMisc as om,
     Profiles as prof,
 )
@@ -1294,7 +1295,8 @@ async def test_station_meter_values_do_not_restore_a_transaction(hass, frozen_ti
     await hass.async_block_till_done()
 
     assert cp._active_tx == {1: running, 0: 0}
-    assert cp._metrics[(0, csess.transaction_id)].value == 0
+    # Left unset, not 0: the flattened sensor reads connector 0 first.
+    assert cp._metrics[(0, csess.transaction_id)].value is None
 
 
 async def test_stop_after_a_restart_mid_session_is_attributed(hass, frozen_time):
@@ -1362,10 +1364,198 @@ async def test_station_meter_values_ignore_a_session_id(hass, frozen_time):
     await hass.async_block_till_done()
 
     assert cp._active_tx == {1: tx_id, 0: 0}
-    assert cp._metrics[(0, csess.transaction_id)].value == 0
+    assert cp._metrics[(0, csess.transaction_id)].value is None
 
     cp.on_stop_transaction(meter_stop=5000, timestamp=None, transaction_id=tx_id)
     await hass.async_block_till_done()
 
     assert cp._tx_indeterminate == set()
     assert cp._active_tx == {1: 0, 0: 0}
+
+
+# --------------------------------------------------------------------------
+# Remote stop: Finishing, then the charger's StopTransaction (Sigenergy EVDC)
+# --------------------------------------------------------------------------
+
+
+def _assert_stop_applied(cp, caplog, *, energy: float, reason: str) -> None:
+    assert "unknown transaction" not in caplog.text
+    assert cp._active_tx[1] == 0
+    assert cp._metrics[(1, csess.transaction_id)].value == 0
+    assert cp._metrics[(1, csess.session_energy)].value == pytest.approx(energy)
+    assert cp._metrics[(1, cstat.stop_reason)].value == reason
+    assert cp._tx_indeterminate == set()
+
+
+@pytest.mark.parametrize("remote_stop", [True, False])
+async def test_stop_after_finishing_is_attributed(
+    hass, frozen_time, monkeypatch, caplog, remote_stop
+):
+    """Finishing, then ~6 s later StopTransaction with meterStop, on one connector."""
+    cp = _mk_cp(hass, connectors=1)
+    await _settle(hass, cp)
+    tx = cp.on_start_transaction(1, "tag-a", 1000).transaction_id
+    cp.on_status_notification(1, "NoError", ChargePointStatus.charging.value)
+    cp.on_meter_values(**_meter_values(tx, value="4000"))
+    cp.on_meter_values(**_station_meter_values())
+    sent = []
+
+    async def accept(req):
+        sent.append(req)
+        return SimpleNamespace(status=RemoteStartStopStatus.accepted)
+
+    monkeypatch.setattr(cp, "call", accept)
+    if remote_stop:
+        assert await cp.stop_transaction(connector_id=1) is True
+        assert [r.transaction_id for r in sent] == [tx]
+
+    caplog.set_level(logging.WARNING)
+    cp.on_status_notification(1, "NoError", ChargePointStatus.finishing.value)
+    frozen_time["now"] = NOW + 7
+    cp.on_stop_transaction(
+        meter_stop=6000, timestamp=None, transaction_id=tx, reason="Remote"
+    )
+    await hass.async_block_till_done()
+
+    _assert_stop_applied(cp, caplog, energy=5.0, reason="Remote")
+
+
+async def test_flattened_transaction_sensor_follows_the_running_session(
+    hass, frozen_time
+):
+    """Station MeterValues must not make the flattened sensor read 0.
+
+    The sensor of a single-connector charger reads connector 0 first. With 0
+    recorded there, it showed no transaction while connector 1 charged, and
+    after a restart connector 1 restored that 0 and lost its session.
+    """
+    from .test_api_paths import _available_central_system
+
+    cp = _mk_cp(hass, connectors=1)
+    await _settle(hass, cp)
+    cs, _ = _available_central_system(hass)
+    cs.charge_points["CP_OK"] = cp
+    tx = cp.on_start_transaction(1, "tag-a", 0).transaction_id
+
+    cp.on_meter_values(**_station_meter_values())
+    await hass.async_block_till_done()
+
+    assert cs.get_metric("ok", csess.transaction_id.value) == tx
+
+
+def _seed_running_session(hass_storage, entry, tx_id: int) -> None:
+    key = _store_key(entry)
+    hass_storage[key] = {
+        "version": 1,
+        "key": key,
+        "data": {
+            "last_tx_id": tx_id,
+            "connectors": {"1": {"tx_id": tx_id, "started_at": NOW - 3000}},
+        },
+    }
+
+
+@pytest.mark.parametrize("ha_state", ["0", None])
+async def test_stop_after_a_restart_is_attributed_from_the_persisted_session(
+    hass, hass_storage, frozen_time, caplog, ha_state
+):
+    """The live sequence: a restart mid-session, then Finishing and the stop.
+
+    Home Assistant restored the flattened sensor as 0 (or nothing), and the
+    charger's MeterValues carry no transactionId, so the session was never
+    live again. Its stop names the id persisted for connector 1 before the
+    restart, which identifies it exactly. The closing values that follow must
+    not revive it.
+    """
+    running = 1_791_075_901
+    entry = _mk_entry(hass)
+    _seed_running_session(hass_storage, entry, running)
+    if ha_state is not None:
+        hass.states.async_set("sensor.test_cpid_transaction_id", ha_state)
+    hass.states.async_set("sensor.test_cpid_energy_meter_start", "1.0")
+    cp = _mk_cp(hass, connectors=1, entry=entry)
+    await _settle(hass, cp)
+
+    unnamed = _meter_values(running, value="4000")
+    unnamed.pop("transaction_id")
+    cp.on_meter_values(**_station_meter_values())
+    cp.on_meter_values(**unnamed)
+    assert cp._live_connectors() == []
+
+    caplog.set_level(logging.WARNING)
+    cp.on_status_notification(1, "NoError", ChargePointStatus.finishing.value)
+    cp.on_stop_transaction(
+        meter_stop=6000, timestamp=None, transaction_id=running, reason="Remote"
+    )
+    await hass.async_block_till_done()
+
+    _assert_stop_applied(cp, caplog, energy=5.0, reason="Remote")
+    assert cp._ended_tx[1] == running
+
+    cp.on_meter_values(
+        **_meter_values(running, context="Transaction.End", value="6000")
+    )
+    await hass.async_block_till_done()
+    assert cp._active_tx[1] == 0
+    assert cp._metrics[(1, csess.transaction_id)].value == 0
+
+    # A repeat of the same stop is not applied a second time.
+    caplog.clear()
+    cp.on_stop_transaction(
+        meter_stop=9000, timestamp=None, transaction_id=running, reason="Other"
+    )
+    await hass.async_block_till_done()
+    assert "unknown transaction" in caplog.text
+    assert cp._metrics[(1, csess.session_energy)].value == pytest.approx(5.0)
+    assert cp._metrics[(1, cstat.stop_reason)].value == "Remote"
+
+
+async def test_stop_for_an_id_never_persisted_is_still_not_applied(
+    hass, hass_storage, frozen_time, caplog
+):
+    """Control: a restart does not make an unknown stop id attributable."""
+    running = 1_791_075_901
+    entry = _mk_entry(hass)
+    _seed_running_session(hass_storage, entry, running)
+    hass.states.async_set("sensor.test_cpid_energy_meter_start", "1.0")
+    cp = _mk_cp(hass, connectors=1, entry=entry)
+    await _settle(hass, cp)
+    unnamed = _meter_values(running, value="4000")
+    unnamed.pop("transaction_id")
+    cp.on_meter_values(**unnamed)
+
+    caplog.set_level(logging.WARNING)
+    cp.on_status_notification(1, "NoError", ChargePointStatus.finishing.value)
+    cp.on_stop_transaction(
+        meter_stop=6000, timestamp=None, transaction_id=running + 1, reason="Remote"
+    )
+    await hass.async_block_till_done()
+
+    assert "unknown transaction" in caplog.text
+    assert cp._metrics[(1, csess.session_energy)].value != pytest.approx(5.0)
+    assert cp._metrics[(1, cstat.stop_reason)].value != "Remote"
+
+
+async def test_persisted_session_does_not_claim_a_stop_on_another_connector(
+    hass, hass_storage, frozen_time
+):
+    """Control: a stop for a connector's recorded session is never redirected.
+
+    Connector 1 ran the id before the restart, but connector 2 has since
+    recorded it: the recorded owner wins, and connector 1 is untouched.
+    """
+    running = 1_791_075_901
+    entry = _mk_entry(hass)
+    _seed_running_session(hass_storage, entry, running)
+    cp = _mk_cp(hass, connectors=2, entry=entry)
+    await _settle(hass, cp)
+    named = _meter_values(running)
+    named["connector_id"] = 2
+    cp.on_meter_values(**named)
+
+    cp.on_stop_transaction(meter_stop=6000, timestamp=None, transaction_id=running)
+    await hass.async_block_till_done()
+
+    assert cp._active_tx[2] == 0
+    assert cp._ended_tx == {2: running}
+    assert cp._tx_indeterminate == set()
