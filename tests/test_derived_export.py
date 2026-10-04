@@ -453,3 +453,77 @@ async def test_disabled_option_keeps_but_does_not_publish_the_total(hass, hass_s
     on = _mk_cp(hass, entry=entry)
     await _settle(hass, on)
     assert _m(on, EAER).value == pytest.approx(0.2)
+
+
+# --------------------------------------------------------------------------
+# Current.Export from power and voltage
+# --------------------------------------------------------------------------
+
+
+def _sigen_v2g(power_w: float, volts: float | None = 392.1) -> list[dict]:
+    """Return a discharge reading as the Sigenergy EVDC really sends it.
+
+    Observed live: negative Power.Active.Import, but Current.Import 0.00 A.
+    """
+    samples = [_sv(PAI, power_w, "W"), _sv(CUR, "0.00", "A")]
+    if volts is not None:
+        samples.append(_sv(Measurand.voltage.value, volts, "V"))
+    return samples
+
+
+async def test_export_current_comes_from_power_when_current_is_unsigned(hass):
+    """A 0 A current during discharge is replaced by power over voltage."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+
+    assert _m(cp, CUR).value == 0.0
+    assert _m(cp, CEX).value == pytest.approx(7269 / 392.1, abs=0.01)
+    assert _m(cp, CEX).extra_attr["estimated"] is True
+    assert _m(cp, CEX).extra_attr["method"] == "power_divided_by_voltage"
+
+
+async def test_dc_pack_voltage_above_ac_range_is_used(hass):
+    """An 800 V-class pack is a real supply voltage, not an implausible one."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-16000, volts=800))
+
+    assert _m(cp, CEX).value == pytest.approx(20.0)
+
+
+async def test_export_current_unknown_without_a_voltage(hass):
+    """No voltage in the reading: export current is unknown, not zero."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269, volts=None))
+
+    assert _m(cp, PAE).value == pytest.approx(7.269)
+    assert _m(cp, CEX).value is None
+
+
+async def test_charging_after_discharge_clears_the_estimate(hass):
+    """Back to charging, export current is a plain zero with no method."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+    _send(cp, T0 + timedelta(seconds=60), *_sigen(16527, 41.0))
+
+    assert _m(cp, CEX).value == 0.0
+    assert _m(cp, CEX).extra_attr["estimated"] is False
+    assert "method" not in _m(cp, CEX).extra_attr
+
+
+async def test_signed_current_from_the_charger_is_preferred(hass):
+    """When the charger signs its current, that measured value wins."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen(-22267, -60.2), _sv(Measurand.voltage.value, 380, "V"))
+
+    assert _m(cp, CEX).value == pytest.approx(60.2)
+    assert _m(cp, CEX).extra_attr["estimated"] is False

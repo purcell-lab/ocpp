@@ -45,6 +45,7 @@ from .derived_export import (
     ATTR_MAX_GAP,
     ATTR_METHOD,
     ATTR_SOURCE,
+    DERIVED_CURRENT_METHOD,
     DERIVED_METHOD,
     DERIVED_SOURCE,
     DerivedExportRegister,
@@ -1607,18 +1608,16 @@ class ChargePoint(cp):
             ATTR_ESTIMATED: False,
         }
 
+        # (connector, export amps from the charger's own signed current)
+        signed_current: tuple[int, float] | None = None
         if cur in reported:
             cid = self._derived_export_target(bucket, cur, connector_id)
             metric = self._metrics[(cid, cur)]
             if isinstance(metric.value, int | float):
                 imp, exp = split_signed(float(metric.value))
                 metric.value = imp
-                self._metrics[(cid, cex)].value = exp
-                self._metrics[(cid, cex)].unit = metric.unit
-                self._metrics[(cid, cex)].extra_attr.update(derived_attrs)
-                self._metrics[(cid, cex)].extra_attr[om.context] = (
-                    metric.extra_attr.get(om.context)
-                )
+                signed_current = (cid, exp)
+                self._set_derived_current(cid, exp, metric, estimated=False)
 
         if pai not in reported:
             return
@@ -1642,6 +1641,20 @@ class ChargePoint(cp):
         export_metric.unit = metric.unit
         export_metric.extra_attr.update(derived_attrs)
         export_metric.extra_attr[om.context] = metric.extra_attr.get(om.context)
+
+        # Some chargers (the Sigenergy EVDC among them) report Current.Import
+        # as 0 A rather than negative while discharging, so the current split
+        # above can never show export. Fall back to power over the voltage
+        # measured in the same reading; never to an assumed voltage.
+        if export_kw > 0 and (signed_current is None or signed_current[1] <= 0):
+            amps = self._export_amps_from_power(bucket, cid, export_kw)
+            current_ref = self._metrics[(cid, cur)]
+            if amps is not None:
+                self._set_derived_current(cid, amps, current_ref, estimated=True)
+            else:
+                # Export is flowing but its current cannot be known: say so
+                # rather than leave a measured-looking zero.
+                self._metrics[(cid, cex)].value = None
 
         ts = parse_sample_timestamp(raw_ts)
         if ts is None:
@@ -1667,6 +1680,34 @@ class ChargePoint(cp):
         )
         if added > 0:
             self._on_derived_export_changed()
+
+    def _set_derived_current(self, cid: int, amps: float, source, *, estimated: bool):
+        """Publish Current.Export, labelled with how it was obtained."""
+        cex = self._metrics[(cid, Measurand.current_export.value)]
+        cex.value = round(amps, 2)
+        cex.unit = source.unit or "A"
+        cex.extra_attr[ATTR_SOURCE] = DERIVED_SOURCE
+        cex.extra_attr[ATTR_ESTIMATED] = estimated
+        if estimated:
+            cex.extra_attr[ATTR_METHOD] = DERIVED_CURRENT_METHOD
+        else:
+            cex.extra_attr.pop(ATTR_METHOD, None)
+        cex.extra_attr[om.context] = source.extra_attr.get(om.context)
+
+    def _export_amps_from_power(self, bucket, cid: int, export_kw: float):
+        """Return export amps from power and this reading's voltage, or None."""
+        voltage = Measurand.voltage.value
+        if voltage not in {sv.measurand for sv in bucket}:
+            return None
+        try:
+            volts = float(self._metrics[(cid, voltage)].value)
+        except (TypeError, ValueError):
+            return None
+        # DC pack voltages run well past the 500 V AC plausibility ceiling
+        # used elsewhere, so only reject values that cannot be a supply.
+        if not volts >= 50.0:
+            return None
+        return export_kw * 1000.0 / (volts * self._phase_count(cid))
 
     def _derived_export_register(self, cid: int) -> DerivedExportRegister:
         """Return the connector's derived export register, creating it if needed."""

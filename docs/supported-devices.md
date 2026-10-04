@@ -197,6 +197,7 @@ Connects over OCPP 1.6 only. The charger answers `MeterValuesSampledData` as an 
 The charger sends no `*.Export.*` measurand, so Home Assistant has no export figures by default. Enable **Derive export (V2G) sensors from negative import readings** in the charge point's options to have the integration:
 
 - split a negative `Power.Active.Import` / `Current.Import` into zero import and a positive `Power.Active.Export` / `Current.Export`;
+- derive `Current.Export` as export power divided by the voltage in the same reading when the charger reports `Current.Import` as 0 A during discharge (the EVDC does), marked `estimated: true`, `method: power_divided_by_voltage`; without a voltage in the reading it is left unknown;
 - integrate the export power over the charger's own sample timestamps (trapezoidal, between samples at most `max(180 s, 3 x meter interval)` apart) into a lifetime `Energy.Active.Export.Register` in kWh.
 
 The derived register is an estimate from instantaneous samples, not a metered counter, and its attributes say so (`source: derived_from_negative_import`, `estimated: true`). It is persisted across restarts, but the first sample after a restart, gap or untimed sample only starts a new baseline, so downtime never adds energy. If the charger ever sends an export measurand itself, the integration logs a warning and stops deriving. The option is available for OCPP 1.6 only.

@@ -25,6 +25,7 @@ import math
 # Attribute values published on every derived metric.
 DERIVED_SOURCE = "derived_from_negative_import"
 DERIVED_METHOD = "trapezoidal_integration"
+DERIVED_CURRENT_METHOD = "power_divided_by_voltage"
 
 # Attribute keys.
 ATTR_SOURCE = "source"
