@@ -23,6 +23,7 @@ from custom_components.ocpp.const import (
     CONF_CPID,
     CONF_CPIDS,
     CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
+    CONF_EXPORT_METER_INTERVAL,
     CONF_ENABLE_HA_NOTIFICATIONS,
     CONF_FORCE_SMART_CHARGING,
     CONF_IDLE_INTERVAL,
@@ -191,6 +192,28 @@ async def test_editing_derive_export_from_negative_import(hass):
     )
 
     assert _stored(entry, "CP_1")[CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT] is True
+
+
+async def test_editing_export_meter_interval(hass):
+    """The export sample interval round-trips through the options flow."""
+    entry = _entry(hass, [{"CP_1": _cp_settings()}])
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_MAX_CURRENT: 32,
+            CONF_MONITORED_VARIABLES_AUTOCONFIG: True,
+            CONF_METER_INTERVAL: 60,
+            CONF_IDLE_INTERVAL: 900,
+            CONF_SKIP_SCHEMA_VALIDATION: False,
+            CONF_FORCE_SMART_CHARGING: True,
+            CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT: True,
+            CONF_EXPORT_METER_INTERVAL: 15,
+        },
+    )
+
+    assert _stored(entry, "CP_1")[CONF_EXPORT_METER_INTERVAL] == 15
 
 
 async def test_the_entry_is_updated_exactly_once(hass):

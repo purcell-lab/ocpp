@@ -20,6 +20,7 @@ from homeassistant.const import UnitOfTime
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.helpers import device_registry, entity_registry
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util.unit_conversion import EnergyConverter
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import WebSocketException
 from websockets.protocol import State
@@ -40,14 +41,24 @@ from ocpp.messages import CallError
 from ocpp.exceptions import NotImplementedError
 
 from .derived_export import (
+    ATTR_DEADBAND,
+    ATTR_DERIVED_DELTA,
+    ATTR_DIVERGENCE,
+    ATTR_DIVERGENCE_PCT,
+    ATTR_REFERENCE_DELTA,
+    ATTR_REFERENCE_ENTITY,
+    ATTR_REFERENCE_STATUS,
     ATTR_ESTIMATED,
     ATTR_LAST_SAMPLE,
     ATTR_MAX_GAP,
     ATTR_METHOD,
     ATTR_SOURCE,
+    DERIVED_CURRENT_METHOD,
     DERIVED_METHOD,
     DERIVED_SOURCE,
+    FLOW_DEADBAND_KW,
     DerivedExportRegister,
+    flow_direction,
     max_sample_gap,
     parse_sample_timestamp,
     split_signed,
@@ -330,6 +341,10 @@ class ChargePoint(cp):
         self._charger_reports_session_energy = False
         # connector_id -> export energy derived from negative import
         self._derived_export: dict[int, DerivedExportRegister] = {}
+        # connector_id -> (reference kWh, derived kWh) at the first comparison
+        self._reference_baseline: dict[int, tuple[float, float]] = {}
+        # connector_id -> derived export energy of the current session (kWh)
+        self._derived_session_export: dict[int, float] = {}
         # Once the charger sends any export measurand itself, stop deriving.
         self._native_export_seen = False
 
@@ -1546,7 +1561,9 @@ class ChargePoint(cp):
                     if timestamps is not None and bucket_idx < len(timestamps)
                     else None
                 )
-                self._derive_export_from_bucket(bucket, connector_id, raw_ts)
+                self._derive_export_from_bucket(
+                    bucket, connector_id, raw_ts, is_transaction
+                )
 
     # ------------------------------------------------------------------
     # Export derived from negative import (derive_export_from_negative_import)
@@ -1580,7 +1597,9 @@ class ChargePoint(cp):
             return 1 if n_connectors == 1 else 0
         return int(connector_id)
 
-    def _derive_export_from_bucket(self, bucket, connector_id, raw_ts) -> None:
+    def _derive_export_from_bucket(
+        self, bucket, connector_id, raw_ts, is_transaction: bool = False
+    ) -> None:
         """Split signed import flows into import/export and integrate export power."""
         reported = {sv.measurand for sv in bucket}
         native = reported & _NATIVE_EXPORT_MEASURANDS
@@ -1607,18 +1626,16 @@ class ChargePoint(cp):
             ATTR_ESTIMATED: False,
         }
 
+        # (connector, export amps from the charger's own signed current)
+        signed_current: tuple[int, float] | None = None
         if cur in reported:
             cid = self._derived_export_target(bucket, cur, connector_id)
             metric = self._metrics[(cid, cur)]
             if isinstance(metric.value, int | float):
                 imp, exp = split_signed(float(metric.value))
                 metric.value = imp
-                self._metrics[(cid, cex)].value = exp
-                self._metrics[(cid, cex)].unit = metric.unit
-                self._metrics[(cid, cex)].extra_attr.update(derived_attrs)
-                self._metrics[(cid, cex)].extra_attr[om.context] = (
-                    metric.extra_attr.get(om.context)
-                )
+                signed_current = (cid, exp)
+                self._set_derived_current(cid, exp, metric, estimated=False)
 
         if pai not in reported:
             return
@@ -1635,6 +1652,12 @@ class ChargePoint(cp):
             return
         _, export_kw = split_signed(signed_kw)
         metric.value = max(float(metric.value), 0.0)
+
+        direction = self._metrics[(cid, cstat.flow_direction)]
+        direction.value = flow_direction(signed_kw)
+        direction.extra_attr[ATTR_SOURCE] = DERIVED_SOURCE
+        direction.extra_attr[ATTR_DEADBAND] = FLOW_DEADBAND_KW
+        self._on_flow_direction(direction.value)
         export_metric = self._metrics[(cid, pae)]
         export_metric.value = (
             export_kw if metric.unit == HA_POWER_UNIT else export_kw * 1000.0
@@ -1642,6 +1665,20 @@ class ChargePoint(cp):
         export_metric.unit = metric.unit
         export_metric.extra_attr.update(derived_attrs)
         export_metric.extra_attr[om.context] = metric.extra_attr.get(om.context)
+
+        # Some chargers (the Sigenergy EVDC among them) report Current.Import
+        # as 0 A rather than negative while discharging, so the current split
+        # above can never show export. Fall back to power over the voltage
+        # measured in the same reading; never to an assumed voltage.
+        if export_kw > 0 and (signed_current is None or signed_current[1] <= 0):
+            amps = self._export_amps_from_power(bucket, cid, export_kw)
+            current_ref = self._metrics[(cid, cur)]
+            if amps is not None:
+                self._set_derived_current(cid, amps, current_ref, estimated=True)
+            else:
+                # Export is flowing but its current cannot be known: say so
+                # rather than leave a measured-looking zero.
+                self._metrics[(cid, cex)].value = None
 
         ts = parse_sample_timestamp(raw_ts)
         if ts is None:
@@ -1663,10 +1700,112 @@ class ChargePoint(cp):
                 ATTR_ESTIMATED: True,
                 ATTR_MAX_GAP: gap,
                 ATTR_LAST_SAMPLE: ts.isoformat(),
+                **register.uncertainty_attributes(),
             }
         )
+        self._update_reference_divergence(cid, reg_metric, register)
+        if is_transaction:
+            # Per-session total: the energy this transaction's own samples
+            # integrated, so a session never inherits export from before it
+            # started or across a restart gap.
+            session = self._derived_session_export.get(cid, 0.0) + added
+            self._derived_session_export[cid] = session
+            self._set_session_export(cid, session)
         if added > 0:
             self._on_derived_export_changed()
+
+    def _update_reference_divergence(self, cid: int, reg_metric, register) -> None:
+        """Compare the derived register with an optional reference counter.
+
+        Diagnostic only, for commissioning: the derived values never depend on
+        the reference. Both are compared as deltas from the first reading
+        taken after start-up, so the reference's lifetime offset is irrelevant.
+        """
+        entity_id = str(
+            getattr(self.settings, "export_reference_entity", "") or ""
+        ).strip()
+        if not entity_id:
+            return
+        reference_kwh = self._reference_energy_kwh(entity_id)
+        attrs = reg_metric.extra_attr
+        attrs[ATTR_REFERENCE_ENTITY] = entity_id
+        if reference_kwh is None:
+            attrs[ATTR_REFERENCE_STATUS] = "unavailable"
+            return
+        baseline = self._reference_baseline.get(cid)
+        if baseline is None:
+            baseline = (reference_kwh, register.energy_kwh)
+            self._reference_baseline[cid] = baseline
+        reference_delta = reference_kwh - baseline[0]
+        derived_delta = register.energy_kwh - baseline[1]
+        attrs[ATTR_REFERENCE_STATUS] = "ok"
+        attrs[ATTR_REFERENCE_DELTA] = round(reference_delta, 6)
+        attrs[ATTR_DERIVED_DELTA] = round(derived_delta, 6)
+        attrs[ATTR_DIVERGENCE] = round(derived_delta - reference_delta, 6)
+        attrs[ATTR_DIVERGENCE_PCT] = (
+            round(100.0 * (derived_delta - reference_delta) / reference_delta, 2)
+            if reference_delta > 0
+            else None
+        )
+
+    def _reference_energy_kwh(self, entity_id: str) -> float | None:
+        """Read the reference entity as kWh, converting its unit; None if unusable."""
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        try:
+            return EnergyConverter.convert(
+                value, state.attributes.get("unit_of_measurement"), HA_ENERGY_UNIT
+            )
+        except HomeAssistantError:
+            return None
+
+    def _set_session_export(self, cid: int, energy_kwh: float) -> None:
+        """Publish the connector's derived export energy for this session."""
+        metric = self._metrics[(cid, csess.session_energy_export)]
+        metric.value = round(energy_kwh, 6)
+        metric.unit = HA_ENERGY_UNIT
+        metric.extra_attr[ATTR_SOURCE] = DERIVED_SOURCE
+        metric.extra_attr[ATTR_ESTIMATED] = True
+
+    def _reset_session_export(self, cid: int) -> None:
+        """Start a new session's derived export total at zero."""
+        if not self._derive_export_enabled():
+            return
+        self._derived_session_export[cid] = 0.0
+        self._set_session_export(cid, 0.0)
+
+    def _set_derived_current(self, cid: int, amps: float, source, *, estimated: bool):
+        """Publish Current.Export, labelled with how it was obtained."""
+        cex = self._metrics[(cid, Measurand.current_export.value)]
+        cex.value = round(amps, 2)
+        cex.unit = source.unit or "A"
+        cex.extra_attr[ATTR_SOURCE] = DERIVED_SOURCE
+        cex.extra_attr[ATTR_ESTIMATED] = estimated
+        if estimated:
+            cex.extra_attr[ATTR_METHOD] = DERIVED_CURRENT_METHOD
+        else:
+            cex.extra_attr.pop(ATTR_METHOD, None)
+        cex.extra_attr[om.context] = source.extra_attr.get(om.context)
+
+    def _export_amps_from_power(self, bucket, cid: int, export_kw: float):
+        """Return export amps from power and this reading's voltage, or None."""
+        voltage = Measurand.voltage.value
+        if voltage not in {sv.measurand for sv in bucket}:
+            return None
+        try:
+            volts = float(self._metrics[(cid, voltage)].value)
+        except (TypeError, ValueError):
+            return None
+        # DC pack voltages run well past the 500 V AC plausibility ceiling
+        # used elsewhere, so only reject values that cannot be a supply.
+        if not volts >= 50.0:
+            return None
+        return export_kw * 1000.0 / (volts * self._phase_count(cid))
 
     def _derived_export_register(self, cid: int) -> DerivedExportRegister:
         """Return the connector's derived export register, creating it if needed."""
@@ -1678,6 +1817,9 @@ class ChargePoint(cp):
 
     def _on_derived_export_changed(self) -> None:
         """Persist the derived register; protocol implementations override."""
+
+    def _on_flow_direction(self, direction: str) -> None:
+        """React to a new flow direction; protocol implementations override."""
 
     @property
     def supported_features(self) -> int:

@@ -62,6 +62,8 @@ def _mk_cp(
     derive: bool = True,
     entry: MockConfigEntry | None = None,
     connectors: int = 1,
+    export_meter_interval: int = 0,
+    export_reference_entity: str = "",
 ) -> ChargePoint:
     entry = entry or _mk_entry(hass)
     hass.data.setdefault(DOMAIN, {})
@@ -76,6 +78,8 @@ def _mk_cp(
         skip_schema_validation=False,
         force_smart_charging=False,
         derive_export_from_negative_import=derive,
+        export_meter_interval=export_meter_interval,
+        export_reference_entity=export_reference_entity,
     )
     conn = SimpleNamespace(state=State.CLOSED, close=lambda: asyncio.sleep(0))
     cp = ChargePoint(CP_ID, conn, hass, entry, centr, chg)
@@ -174,9 +178,26 @@ def test_register_integrates_trapezoids_and_never_bridges():
 
 def test_register_round_trip_drops_the_baseline():
     """Only the energy persists, so a restart can never bridge the downtime."""
-    reg = DerivedExportRegister(energy_kwh=1.25, last_ts=T0, last_kw=3.0)
+    reg = DerivedExportRegister(
+        energy_kwh=1.25,
+        energy_low_kwh=1.0,
+        energy_high_kwh=1.5,
+        step_intervals=2,
+        last_ts=T0,
+        last_kw=3.0,
+    )
     restored = DerivedExportRegister.from_dict(reg.to_dict())
-    assert restored == DerivedExportRegister(energy_kwh=1.25)
+    assert restored == DerivedExportRegister(
+        energy_kwh=1.25, energy_low_kwh=1.0, energy_high_kwh=1.5, step_intervals=2
+    )
+    # A total persisted before the bounds existed restores as exact.
+    legacy = DerivedExportRegister.from_dict({"energy_kwh": 0.5})
+    assert (legacy.energy_low_kwh, legacy.energy_high_kwh) == (0.5, 0.5)
+    # Inconsistent bounds are discarded rather than trusted.
+    bad = DerivedExportRegister.from_dict(
+        {"energy_kwh": 0.5, "energy_low_kwh": 0.9, "energy_high_kwh": 0.1}
+    )
+    assert (bad.energy_low_kwh, bad.energy_high_kwh) == (0.5, 0.5)
     for bad in (None, {}, {"energy_kwh": "x"}, {"energy_kwh": -1}, [1]):
         assert DerivedExportRegister.from_dict(bad) is None
     assert DerivedExportRegister.from_dict({"energy_kwh": float("inf")}) is None
@@ -340,7 +361,7 @@ async def test_register_survives_a_restart_without_bridging(hass, hass_storage):
     async_fire_time_changed(hass, datetime.now(tz=UTC).replace(year=2100))
     await hass.async_block_till_done()
     stored = hass_storage[cp._tx_store.key]["data"]["derived_export"]
-    assert stored == {"1": {"energy_kwh": pytest.approx(0.2)}}
+    assert stored["1"]["energy_kwh"] == pytest.approx(0.2)
 
     # A new process: same entry, same storage.
     cp2 = _mk_cp(hass, entry=entry)
@@ -422,7 +443,7 @@ async def test_export_sensors_exist_only_when_deriving(hass, bypass_websockets, 
 
     registry = er.async_get(hass)
     cpid = cp_cfg["cpid"]
-    for measurand in (PAE, CEX, EAER):
+    for measurand in (PAE, CEX, EAER, "Flow.Direction", "Energy.Session.Export"):
         found = registry.async_get_entity_id(
             "sensor", DOMAIN, sensor_unique_id(cpid, measurand, None)
         )
@@ -446,10 +467,448 @@ async def test_disabled_option_keeps_but_does_not_publish_the_total(hass, hass_s
     off = _mk_cp(hass, entry=entry, derive=False)
     await _settle(hass, off)
     assert _m(off, EAER).value is None
-    assert off._tx_store_snapshot()["derived_export"] == {
-        "1": {"energy_kwh": pytest.approx(0.2)}
-    }
+    assert off._tx_store_snapshot()["derived_export"]["1"][
+        "energy_kwh"
+    ] == pytest.approx(0.2)
 
     on = _mk_cp(hass, entry=entry)
     await _settle(hass, on)
     assert _m(on, EAER).value == pytest.approx(0.2)
+
+
+# --------------------------------------------------------------------------
+# Current.Export from power and voltage
+# --------------------------------------------------------------------------
+
+
+def _sigen_v2g(power_w: float, volts: float | None = 392.1) -> list[dict]:
+    """Return a discharge reading as the Sigenergy EVDC really sends it.
+
+    Observed live: negative Power.Active.Import, but Current.Import 0.00 A.
+    """
+    samples = [_sv(PAI, power_w, "W"), _sv(CUR, "0.00", "A")]
+    if volts is not None:
+        samples.append(_sv(Measurand.voltage.value, volts, "V"))
+    return samples
+
+
+async def test_export_current_comes_from_power_when_current_is_unsigned(hass):
+    """A 0 A current during discharge is replaced by power over voltage."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+
+    assert _m(cp, CUR).value == 0.0
+    assert _m(cp, CEX).value == pytest.approx(7269 / 392.1, abs=0.01)
+    assert _m(cp, CEX).extra_attr["estimated"] is True
+    assert _m(cp, CEX).extra_attr["method"] == "power_divided_by_voltage"
+
+
+async def test_dc_pack_voltage_above_ac_range_is_used(hass):
+    """An 800 V-class pack is a real supply voltage, not an implausible one."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-16000, volts=800))
+
+    assert _m(cp, CEX).value == pytest.approx(20.0)
+
+
+async def test_export_current_unknown_without_a_voltage(hass):
+    """No voltage in the reading: export current is unknown, not zero."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269, volts=None))
+
+    assert _m(cp, PAE).value == pytest.approx(7.269)
+    assert _m(cp, CEX).value is None
+
+
+async def test_charging_after_discharge_clears_the_estimate(hass):
+    """Back to charging, export current is a plain zero with no method."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+    _send(cp, T0 + timedelta(seconds=60), *_sigen(16527, 41.0))
+
+    assert _m(cp, CEX).value == 0.0
+    assert _m(cp, CEX).extra_attr["estimated"] is False
+    assert "method" not in _m(cp, CEX).extra_attr
+
+
+async def test_signed_current_from_the_charger_is_preferred(hass):
+    """When the charger signs its current, that measured value wins."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen(-22267, -60.2), _sv(Measurand.voltage.value, 380, "V"))
+
+    assert _m(cp, CEX).value == pytest.approx(60.2)
+    assert _m(cp, CEX).extra_attr["estimated"] is False
+
+
+# --------------------------------------------------------------------------
+# Flow direction
+# --------------------------------------------------------------------------
+
+FLOW = "Flow.Direction"
+
+
+@pytest.mark.parametrize(
+    ("power_w", "expected"),
+    [
+        (16527, "import"),
+        (-7269, "export"),
+        (-249, "export"),  # smallest real discharge observed
+        (-58, "idle"),  # session-start noise with 0 A
+        (-7, "idle"),  # residue after the discharge stopped
+        (50, "idle"),
+    ],
+)
+async def test_flow_direction_follows_power_sign(hass, power_w, expected):
+    """Direction comes from the power sign, with a small deadband."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(power_w))
+
+    assert cp._metrics[(1, FLOW)].value == expected
+    assert cp._metrics[(1, FLOW)].extra_attr["deadband_kw"] == 0.1
+
+
+async def test_flow_direction_goes_idle_when_the_session_closes(hass):
+    """Clearing flow readings at a stop also clears the direction."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+    cp._zero_flow_measurands(1)
+
+    assert cp._metrics[(1, FLOW)].value == "idle"
+
+
+async def test_flow_direction_not_published_without_the_option(hass):
+    """Control: without the option there is no direction metric."""
+    cp = _mk_cp(hass, derive=False)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+
+    assert cp._metrics[(1, FLOW)].value is None
+
+
+# --------------------------------------------------------------------------
+# Per-session export energy
+# --------------------------------------------------------------------------
+
+SESSION_EXPORT = "Energy.Session.Export"
+
+
+def _send_tx(cp: ChargePoint, tx: int, ts: datetime, *samples: dict) -> None:
+    cp.on_meter_values(
+        connector_id=1,
+        meter_value=[{"timestamp": ts.isoformat(), "sampled_value": list(samples)}],
+        transaction_id=tx,
+    )
+
+
+async def test_session_export_counts_only_this_transaction(hass):
+    """Export before a session starts is not billed to it; a new one resets."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    # Outside any transaction: the lifetime register moves, no session does.
+    _send(cp, T0, *_sigen_v2g(-12000))
+    _send(cp, T0 + timedelta(seconds=60), *_sigen_v2g(-12000))
+    assert _m(cp, EAER).value == pytest.approx(0.2)
+
+    tx = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    assert _m(cp, SESSION_EXPORT).value == 0.0
+
+    _send_tx(cp, tx, T0 + timedelta(seconds=120), *_sigen_v2g(-12000))
+    _send_tx(cp, tx, T0 + timedelta(seconds=180), *_sigen_v2g(-12000))
+    assert _m(cp, SESSION_EXPORT).value == pytest.approx(0.4)
+    assert _m(cp, SESSION_EXPORT).extra_attr["estimated"] is True
+    assert _m(cp, EAER).value == pytest.approx(0.6)
+
+    second = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    assert second != tx
+    assert _m(cp, SESSION_EXPORT).value == 0.0
+
+
+async def test_session_export_survives_a_restart_of_the_same_session(
+    hass, hass_storage
+):
+    """A running session keeps its total across a restart; downtime adds none."""
+    entry = _mk_entry(hass)
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+    tx = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    async_fire_time_changed(hass, datetime.now(tz=UTC).replace(year=2100))
+    await hass.async_block_till_done()
+    _send_tx(cp, tx, T0, *_sigen_v2g(-12000))
+    _send_tx(cp, tx, T0 + timedelta(seconds=60), *_sigen_v2g(-12000))
+    async_fire_time_changed(hass, datetime.now(tz=UTC).replace(year=2101))
+    await hass.async_block_till_done()
+    stored = hass_storage[cp._tx_store.key]["data"]["derived_session_export"]
+    assert stored == {"1": {"tx_id": tx, "energy_kwh": pytest.approx(0.2)}}
+
+    cp2 = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp2)
+    assert _m(cp2, SESSION_EXPORT).value == pytest.approx(0.2)
+
+
+async def test_session_export_of_another_transaction_is_not_restored(
+    hass, hass_storage
+):
+    """A total recorded for a different transaction never carries over."""
+    entry = _mk_entry(hass)
+    key = ChargePoint(
+        CP_ID,
+        SimpleNamespace(state=State.CLOSED, close=lambda: asyncio.sleep(0)),
+        hass,
+        entry,
+        CentralSystemSettings(**entry.data),
+        ChargerSystemSettings(
+            cpid="test_cpid",
+            max_current=32,
+            idle_interval=60,
+            meter_interval=60,
+            monitored_variables="",
+            monitored_variables_autoconfig=False,
+            skip_schema_validation=False,
+            force_smart_charging=False,
+        ),
+    )._tx_store.key
+    hass_storage[key] = {
+        "version": 1,
+        "key": key,
+        "data": {
+            "last_tx_id": 4242,
+            "connectors": {"1": {"tx_id": 4242, "started_at": 1_800_000_000.0}},
+            "derived_session_export": {"1": {"tx_id": 1111, "energy_kwh": 3.5}},
+        },
+    }
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+
+    assert _m(cp, SESSION_EXPORT).value is None
+
+
+# --------------------------------------------------------------------------
+# Uncertainty
+# --------------------------------------------------------------------------
+
+
+async def test_bounds_and_steps_replay_the_live_v2g_run(hass):
+    """Replay the observed 4 October discharge and check the published bounds.
+
+    The independent inverter counter recorded 1.250 kWh. The point estimate
+    is high because export started and stopped mid-interval; the bounds
+    bracket the true value and the two step intervals are counted.
+    """
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+    readings = [  # (seconds after T0, signed W) as received from the charger
+        (0, 16527),
+        (60, -249),
+        (120, -269),
+        (180, -359),
+        (240, -229),
+        (300, -7048),
+        (361, -7269),
+        (421, -7267),
+        (481, -7332),
+        (541, -7601),
+        (601, -18819),
+        (661, -21839),
+        (721, -7),
+    ]
+    for offset, watts in readings:
+        _send(cp, T0 + timedelta(seconds=offset), *_sigen_v2g(watts))
+
+    reg = _m(cp, EAER)
+    assert reg.value == pytest.approx(1.3067, abs=0.001)
+    low = reg.extra_attr["energy_lower_bound_kwh"]
+    high = reg.extra_attr["energy_upper_bound_kwh"]
+    assert low < 1.250 < high
+    assert low <= reg.value <= high
+    # Export starting, the 0.2 -> 7 kW jump, the 7.6 -> 18.8 kW jump, the
+    # 18.8 -> 21.8 kW change and export stopping.
+    assert reg.extra_attr["step_intervals"] == 5
+    assert reg.extra_attr["last_interval_s"] == 60
+
+
+async def test_steady_export_has_tight_bounds(hass):
+    """Constant power: the bounds collapse onto the estimate, no steps."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+    for i in range(4):
+        _send(cp, T0 + timedelta(seconds=60 * i), *_sigen_v2g(-7300))
+
+    reg = _m(cp, EAER)
+    assert reg.extra_attr["energy_lower_bound_kwh"] == pytest.approx(reg.value)
+    assert reg.extra_attr["energy_upper_bound_kwh"] == pytest.approx(reg.value)
+    assert reg.extra_attr["step_intervals"] == 0
+
+
+# --------------------------------------------------------------------------
+# Adaptive sample interval while exporting
+# --------------------------------------------------------------------------
+
+
+def _accepting(cp: ChargePoint, status: str = "Accepted") -> list[str]:
+    """Stub the charger link; return the list of requested intervals."""
+    sent: list[str] = []
+
+    async def call(req, *args, **kwargs):
+        sent.append(req.value)
+        return SimpleNamespace(status=status)
+
+    cp.call = call
+    return sent
+
+
+async def _feed(hass, cp, offsets_watts):
+    for offset, watts in offsets_watts:
+        _send(cp, T0 + timedelta(seconds=offset), *_sigen_v2g(watts))
+        await hass.async_block_till_done()
+
+
+async def test_export_requests_the_fast_interval_then_releases_it(hass):
+    """10 s while exporting; back to 60 s after five samples without export."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    sent = _accepting(cp)
+
+    await _feed(hass, cp, [(0, 16000), (60, -7300)])
+    assert sent == ["10"]
+    assert cp._export_interval_state == "fast"
+
+    # More export does not re-send; four quiet samples are not enough.
+    await _feed(hass, cp, [(70, -7300)] + [(80 + 10 * i, 16000) for i in range(4)])
+    assert sent == ["10"]
+
+    await _feed(hass, cp, [(130, 16000)])
+    assert sent == ["10", "60"]
+    assert cp._export_interval_state == "normal"
+
+
+async def test_a_refusing_charger_is_left_alone(hass, caplog):
+    """One refusal: warn once, never ask again, keep integrating."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    sent = _accepting(cp, status="NotSupported")
+
+    await _feed(hass, cp, [(0, -7300), (60, -7300), (120, 16000), (180, -7300)])
+
+    assert sent == ["10"]
+    assert cp._export_interval_unsupported is True
+    assert caplog.text.count("did not accept MeterValueSampleInterval") == 1
+    # 7.3 kW for a minute, then a ramp down and a ramp up: 0.1217 + 2 x 0.0608.
+    assert _m(cp, EAER).value == pytest.approx(0.2433, abs=0.001)
+
+
+async def test_session_end_releases_the_fast_interval(hass):
+    """A stop while sampling fast restores the normal interval."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    sent = _accepting(cp)
+    tx = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    _send_tx(cp, tx, T0, *_sigen_v2g(-7300))
+    await hass.async_block_till_done()
+
+    cp.on_stop_transaction(meter_stop=15_000_000, timestamp=None, transaction_id=tx)
+    await hass.async_block_till_done()
+
+    assert sent == ["10", "60"]
+
+
+async def test_reconnect_configuration_resets_the_state(hass):
+    """post_connect rewrites the normal interval, so fast is forgotten."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    _accepting(cp)
+    await _feed(hass, cp, [(0, -7300)])
+    assert cp._export_interval_state == "fast"
+
+    async def configure(key, value):
+        return None
+
+    cp.configure = configure
+    await cp.set_standard_configuration()
+    assert cp._export_interval_state == "normal"
+
+
+@pytest.mark.parametrize(("derive", "interval"), [(True, 0), (False, 10), (True, 60)])
+async def test_no_interval_changes_unless_enabled(hass, derive, interval):
+    """Disabled, derivation off, or no faster than normal: nothing is sent."""
+    cp = _mk_cp(hass, derive=derive, export_meter_interval=interval)
+    await _settle(hass, cp)
+    sent = _accepting(cp)
+
+    await _feed(hass, cp, [(0, -7300), (60, -7300)])
+
+    assert sent == []
+
+
+# --------------------------------------------------------------------------
+# Optional reference divergence (diagnostic)
+# --------------------------------------------------------------------------
+
+REF = "sensor.inverter_total_discharging_capacity"
+
+
+async def test_divergence_against_a_reference_in_mwh(hass):
+    """Deltas from the first comparison, with the reference's unit converted."""
+    cp = _mk_cp(hass, export_reference_entity=REF)
+    await _settle(hass, cp)
+
+    hass.states.async_set(REF, "11.06370", {"unit_of_measurement": "MWh"})
+    _send(cp, T0, *_sigen_v2g(-12000))
+    hass.states.async_set(REF, "11.06390", {"unit_of_measurement": "MWh"})
+    _send(cp, T0 + timedelta(seconds=60), *_sigen_v2g(-12000))
+
+    attrs = _m(cp, EAER).extra_attr
+    assert attrs["reference_entity"] == REF
+    assert attrs["reference_status"] == "ok"
+    assert attrs["reference_delta_kwh"] == pytest.approx(0.2)
+    assert attrs["derived_delta_kwh"] == pytest.approx(0.2)
+    assert attrs["divergence_kwh"] == pytest.approx(0.0, abs=1e-6)
+    assert attrs["divergence_pct"] == pytest.approx(0.0, abs=0.01)
+
+
+async def test_reference_never_changes_the_derived_values(hass):
+    """The reference is diagnostic only: same register with or without it."""
+    with_ref = _mk_cp(hass, export_reference_entity=REF)
+    await _settle(hass, with_ref)
+    hass.states.async_set(REF, "999", {"unit_of_measurement": "kWh"})
+    plain = _mk_cp(hass)
+    await _settle(hass, plain)
+    for cp in (with_ref, plain):
+        _send(cp, T0, *_sigen_v2g(-12000))
+        _send(cp, T0 + timedelta(seconds=60), *_sigen_v2g(-9000))
+
+    assert _m(with_ref, EAER).value == _m(plain, EAER).value
+    assert "reference_entity" not in _m(plain, EAER).extra_attr
+
+
+@pytest.mark.parametrize(
+    ("state", "unit"),
+    [("unavailable", "kWh"), ("not a number", "kWh"), ("5", "bananas"), (None, None)],
+)
+async def test_unusable_reference_is_reported_not_guessed(hass, state, unit):
+    """Missing, non-numeric or unconvertible reference: status unavailable."""
+    cp = _mk_cp(hass, export_reference_entity=REF)
+    await _settle(hass, cp)
+    if state is not None:
+        hass.states.async_set(REF, state, {"unit_of_measurement": unit})
+
+    _send(cp, T0, *_sigen_v2g(-12000))
+
+    attrs = _m(cp, EAER).extra_attr
+    assert attrs["reference_status"] == "unavailable"
+    assert "divergence_kwh" not in attrs

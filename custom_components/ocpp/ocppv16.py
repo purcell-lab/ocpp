@@ -48,7 +48,7 @@ from .chargepoint import (
     SetVariableResult,
 )
 from .chargepoint import ChargePoint as cp
-from .derived_export import DerivedExportRegister
+from .derived_export import FLOW_EXPORT, FLOW_IDLE, DerivedExportRegister
 
 from .enums import (
     ConfigurationKey as ckey,
@@ -102,6 +102,8 @@ _MAX_CONNECTORS = 10
 # Home Assistant's disk.
 _TX_STORE_VERSION = 1
 _TX_STORE_SAVE_DELAY = 1.0
+# Non-export samples after which the fast export sample interval is released.
+EXPORT_INTERVAL_RELEASE_SAMPLES = 5
 
 # Connector statuses that prove a transaction is running, and ones that prove
 # the connector has none. Anything else - Faulted, Preparing - says nothing
@@ -205,6 +207,11 @@ class ChargePoint(cp):
             hass, _TX_STORE_VERSION, tx_store_key(entry.entry_id, id)
         )
         self._tx_store_load = None
+        # Adaptive sample interval while exporting (export_meter_interval):
+        # "normal", "fast" or "pending" while a change is in flight.
+        self._export_interval_state = "normal"
+        self._export_interval_unsupported = False
+        self._non_export_samples = 0
 
     # ------------------------------------------------------------------
     # Transaction identity, timing and containment (#2123)
@@ -281,6 +288,7 @@ class ChargePoint(cp):
                 "start_time_estimated"
             ):
                 self._set_session_start(conn, started, estimated=False)
+        self._restore_session_export(data.get("derived_session_export"))
 
     def _restore_derived_export(self, data) -> None:
         """Adopt persisted derived export registers.
@@ -305,6 +313,9 @@ class ChargePoint(cp):
                 # Samples integrated before the load finished are on top of
                 # the persisted total, not instead of it.
                 live.energy_kwh += restored.energy_kwh
+                live.energy_low_kwh += restored.energy_low_kwh
+                live.energy_high_kwh += restored.energy_high_kwh
+                live.step_intervals += restored.step_intervals
             else:
                 self._derived_export[conn] = restored
             if not self._derive_export_enabled():
@@ -314,6 +325,130 @@ class ChargePoint(cp):
             ]
             metric.value = round(self._derived_export[conn].energy_kwh, 6)
             metric.unit = HA_ENERGY_UNIT
+            metric.extra_attr.update(
+                self._derived_export[conn].uncertainty_attributes()
+            )
+
+    def _restore_session_export(self, data) -> None:
+        """Adopt a persisted session export total for the session still running.
+
+        Only a total recorded for the transaction persisted as running on that
+        connector is restored, so a finished or different session can never
+        inherit it.
+        """
+        if not isinstance(data, dict) or not self._derive_export_enabled():
+            return
+        for key, item in data.items():
+            try:
+                conn = int(key)
+                tx = int(item["tx_id"])
+                energy = float(item["energy_kwh"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(energy) or energy < 0:
+                continue
+            persisted = self._persisted_tx.get(conn)
+            if persisted is None or persisted[0] != tx:
+                continue
+            total = self._derived_session_export.get(conn, 0.0) + energy
+            self._derived_session_export[conn] = total
+            self._set_session_export(conn, total)
+
+    def _export_interval_targets(self) -> tuple[int, int] | None:
+        """Return (fast, normal) sample intervals, or None if not adaptive."""
+        try:
+            fast = int(getattr(self.settings, "export_meter_interval", 0) or 0)
+            normal = int(self.settings.meter_interval)
+        except (TypeError, ValueError):
+            return None
+        if self._export_interval_unsupported or fast <= 0 or fast >= normal:
+            return None
+        return fast, normal
+
+    def _on_flow_direction(self, direction: str) -> None:
+        """Sample faster while exporting, and return to normal afterwards.
+
+        At the usual 60 s interval the derived export energy was only good
+        to about 15 % on a stepped V2G profile; at 10 s it was within about
+        2 %. The fast interval is requested on the first export sample and
+        released after EXPORT_INTERVAL_RELEASE_SAMPLES samples without
+        export, so charging-only sessions keep the normal message rate.
+        """
+        targets = self._export_interval_targets()
+        if targets is None:
+            return
+        fast, normal = targets
+        if direction == FLOW_EXPORT:
+            self._non_export_samples = 0
+            if self._export_interval_state == "normal":
+                self._request_sample_interval(fast, "fast")
+            return
+        if self._export_interval_state != "fast":
+            return
+        self._non_export_samples += 1
+        if self._non_export_samples >= EXPORT_INTERVAL_RELEASE_SAMPLES:
+            self._request_sample_interval(normal, "normal")
+
+    def _release_export_interval(self) -> None:
+        """Return to the normal interval when a session ends while fast."""
+        targets = self._export_interval_targets()
+        if targets is not None and self._export_interval_state == "fast":
+            self._request_sample_interval(targets[1], "normal")
+
+    def _request_sample_interval(self, seconds: int, target_state: str) -> None:
+        previous = self._export_interval_state
+        self._export_interval_state = "pending"
+        self.hass.async_create_task(
+            self._async_set_sample_interval(seconds, target_state, previous)
+        )
+
+    async def _async_set_sample_interval(
+        self, seconds: int, target_state: str, previous: str
+    ) -> None:
+        """Change MeterValueSampleInterval quietly; give up for good on refusal.
+
+        configure() raises a Home Assistant notification for every refusal,
+        which would repeat on every export; a charger that refuses once is
+        simply left at its normal interval.
+        """
+        try:
+            resp = await self.call(
+                call.ChangeConfiguration(
+                    key=ckey.meter_value_sample_interval.value, value=str(seconds)
+                )
+            )
+            status = getattr(resp, "status", None)
+        except Exception as ex:  # a failed change must never break metering
+            status = None
+            _LOGGER.debug("%s: sample interval change failed: %s", self.id, ex)
+        if status == ConfigurationStatus.accepted:
+            self._export_interval_state = target_state
+            self._non_export_samples = 0
+            _LOGGER.debug(
+                "%s: meter sample interval set to %s s (%s)",
+                self.id,
+                seconds,
+                target_state,
+            )
+            return
+        self._export_interval_state = previous
+        if target_state == "fast":
+            self._export_interval_unsupported = True
+            _LOGGER.warning(
+                "%s did not accept MeterValueSampleInterval=%s (%s); keeping the "
+                "normal interval while exporting",
+                self.id,
+                seconds,
+                status,
+            )
+        else:
+            _LOGGER.warning(
+                "%s did not accept returning MeterValueSampleInterval to %s s "
+                "(%s); will retry",
+                self.id,
+                seconds,
+                status,
+            )
 
     def _on_derived_export_changed(self) -> None:
         """Persist the derived export register with the transaction state."""
@@ -353,6 +488,13 @@ class ChargePoint(cp):
                 str(conn): register.to_dict()
                 for conn, register in self._derived_export.items()
             }
+        session_export = {
+            str(conn): {"tx_id": int(self._active_tx[conn]), "energy_kwh": energy}
+            for conn, energy in self._derived_session_export.items()
+            if self._active_tx.get(conn)
+        }
+        if session_export:
+            snapshot["derived_session_export"] = session_export
         return snapshot
 
     def _schedule_tx_store_save(self) -> None:
@@ -765,6 +907,9 @@ class ChargePoint(cp):
 
     async def set_standard_configuration(self):
         """Send configuration values to the charger."""
+        # This writes the normal interval, so any fast interval is gone.
+        self._export_interval_state = "normal"
+        self._non_export_samples = 0
         await self.configure(
             ckey.meter_value_sample_interval,
             str(self.settings.meter_interval),
@@ -1917,6 +2062,7 @@ class ChargePoint(cp):
             self._metrics[(connector_id, csess.session_time)].unit = UnitOfTime.MINUTES
             self._metrics[(connector_id, csess.session_energy)].value = 0.0
             self._metrics[(connector_id, csess.session_energy)].unit = HA_ENERGY_UNIT
+            self._reset_session_export(connector_id)
 
             self._schedule_tx_store_save()
             self._report_transaction_start(connector_id, tx_id, connector_id)
@@ -1989,6 +2135,7 @@ class ChargePoint(cp):
         self._apply_stop_energy(conn, meter_stop)
 
         self._zero_flow_measurands(conn)
+        self._release_export_interval()
         self._schedule_tx_store_save()
 
         self.hass.async_create_task(self.update(self.settings.cpid))
@@ -2025,3 +2172,6 @@ class ChargePoint(cp):
             key = (connector_id, meas)
             if key in self._metrics:
                 self._metrics[key].value = 0
+        direction = (connector_id, cstat.flow_direction)
+        if direction in self._metrics:
+            self._metrics[direction].value = FLOW_IDLE
