@@ -1648,6 +1648,7 @@ class ChargePoint(cp):
         direction.value = flow_direction(signed_kw)
         direction.extra_attr[ATTR_SOURCE] = DERIVED_SOURCE
         direction.extra_attr[ATTR_DEADBAND] = FLOW_DEADBAND_KW
+        self._on_flow_direction(direction.value)
         export_metric = self._metrics[(cid, pae)]
         export_metric.value = (
             export_kw if metric.unit == HA_POWER_UNIT else export_kw * 1000.0
@@ -1756,6 +1757,9 @@ class ChargePoint(cp):
 
     def _on_derived_export_changed(self) -> None:
         """Persist the derived register; protocol implementations override."""
+
+    def _on_flow_direction(self, direction: str) -> None:
+        """React to a new flow direction; protocol implementations override."""
 
     @property
     def supported_features(self) -> int:

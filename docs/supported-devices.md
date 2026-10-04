@@ -206,6 +206,8 @@ An **Energy Session Export** sensor gives the derived export energy of the curre
 
 The register also publishes how far it can be trusted: `energy_lower_bound_kwh` / `energy_upper_bound_kwh` (holding the lower / higher sample of each interval), `step_intervals` (intervals where export started or stopped, or power moved by more than 2 kW, which is where nearly all the error comes from at a 60 s sample interval) and `last_interval_s`.
 
+While exporting, the integration asks the charger for a faster `MeterValueSampleInterval` (**Meter sample interval while exporting**, default 10 s; 0 disables) and returns it to the normal meter interval after five samples without export or when the session stops. Re-sampling a live V2G run showed 60 s sampling is only good to about 15 % on a stepped discharge, against about 2 % at 10 s. A charger that refuses the change is left at its normal interval, with one warning.
+
 The derived register is an estimate from instantaneous samples, not a metered counter, and its attributes say so (`source: derived_from_negative_import`, `estimated: true`). It is persisted across restarts, but the first sample after a restart, gap or untimed sample only starts a new baseline, so downtime never adds energy. If the charger ever sends an export measurand itself, the integration logs a warning and stops deriving. The option is available for OCPP 1.6 only.
 
 Whether this charger reports discharge as negative import has not yet been confirmed on a live V2G session; check the derived sensors against an independent meter before relying on them.

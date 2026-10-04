@@ -62,6 +62,7 @@ def _mk_cp(
     derive: bool = True,
     entry: MockConfigEntry | None = None,
     connectors: int = 1,
+    export_meter_interval: int = 0,
 ) -> ChargePoint:
     entry = entry or _mk_entry(hass)
     hass.data.setdefault(DOMAIN, {})
@@ -76,6 +77,7 @@ def _mk_cp(
         skip_schema_validation=False,
         force_smart_charging=False,
         derive_export_from_negative_import=derive,
+        export_meter_interval=export_meter_interval,
     )
     conn = SimpleNamespace(state=State.CLOSED, close=lambda: asyncio.sleep(0))
     cp = ChargePoint(CP_ID, conn, hass, entry, centr, chg)
@@ -749,3 +751,103 @@ async def test_steady_export_has_tight_bounds(hass):
     assert reg.extra_attr["energy_lower_bound_kwh"] == pytest.approx(reg.value)
     assert reg.extra_attr["energy_upper_bound_kwh"] == pytest.approx(reg.value)
     assert reg.extra_attr["step_intervals"] == 0
+
+
+# --------------------------------------------------------------------------
+# Adaptive sample interval while exporting
+# --------------------------------------------------------------------------
+
+
+def _accepting(cp: ChargePoint, status: str = "Accepted") -> list[str]:
+    """Stub the charger link; return the list of requested intervals."""
+    sent: list[str] = []
+
+    async def call(req, *args, **kwargs):
+        sent.append(req.value)
+        return SimpleNamespace(status=status)
+
+    cp.call = call
+    return sent
+
+
+async def _feed(hass, cp, offsets_watts):
+    for offset, watts in offsets_watts:
+        _send(cp, T0 + timedelta(seconds=offset), *_sigen_v2g(watts))
+        await hass.async_block_till_done()
+
+
+async def test_export_requests_the_fast_interval_then_releases_it(hass):
+    """10 s while exporting; back to 60 s after five samples without export."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    sent = _accepting(cp)
+
+    await _feed(hass, cp, [(0, 16000), (60, -7300)])
+    assert sent == ["10"]
+    assert cp._export_interval_state == "fast"
+
+    # More export does not re-send; four quiet samples are not enough.
+    await _feed(hass, cp, [(70, -7300)] + [(80 + 10 * i, 16000) for i in range(4)])
+    assert sent == ["10"]
+
+    await _feed(hass, cp, [(130, 16000)])
+    assert sent == ["10", "60"]
+    assert cp._export_interval_state == "normal"
+
+
+async def test_a_refusing_charger_is_left_alone(hass, caplog):
+    """One refusal: warn once, never ask again, keep integrating."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    sent = _accepting(cp, status="NotSupported")
+
+    await _feed(hass, cp, [(0, -7300), (60, -7300), (120, 16000), (180, -7300)])
+
+    assert sent == ["10"]
+    assert cp._export_interval_unsupported is True
+    assert caplog.text.count("did not accept MeterValueSampleInterval") == 1
+    # 7.3 kW for a minute, then a ramp down and a ramp up: 0.1217 + 2 x 0.0608.
+    assert _m(cp, EAER).value == pytest.approx(0.2433, abs=0.001)
+
+
+async def test_session_end_releases_the_fast_interval(hass):
+    """A stop while sampling fast restores the normal interval."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    sent = _accepting(cp)
+    tx = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    _send_tx(cp, tx, T0, *_sigen_v2g(-7300))
+    await hass.async_block_till_done()
+
+    cp.on_stop_transaction(meter_stop=15_000_000, timestamp=None, transaction_id=tx)
+    await hass.async_block_till_done()
+
+    assert sent == ["10", "60"]
+
+
+async def test_reconnect_configuration_resets_the_state(hass):
+    """post_connect rewrites the normal interval, so fast is forgotten."""
+    cp = _mk_cp(hass, export_meter_interval=10)
+    await _settle(hass, cp)
+    _accepting(cp)
+    await _feed(hass, cp, [(0, -7300)])
+    assert cp._export_interval_state == "fast"
+
+    async def configure(key, value):
+        return None
+
+    cp.configure = configure
+    await cp.set_standard_configuration()
+    assert cp._export_interval_state == "normal"
+
+
+@pytest.mark.parametrize(("derive", "interval"), [(True, 0), (False, 10), (True, 60)])
+async def test_no_interval_changes_unless_enabled(hass, derive, interval):
+    """Disabled, derivation off, or no faster than normal: nothing is sent."""
+    cp = _mk_cp(hass, derive=derive, export_meter_interval=interval)
+    await _settle(hass, cp)
+    sent = _accepting(cp)
+
+    await _feed(hass, cp, [(0, -7300), (60, -7300)])
+
+    assert sent == []
