@@ -1690,6 +1690,7 @@ class ChargePoint(cp):
                 ATTR_ESTIMATED: True,
                 ATTR_MAX_GAP: gap,
                 ATTR_LAST_SAMPLE: ts.isoformat(),
+                **register.uncertainty_attributes(),
             }
         )
         if is_transaction:

@@ -306,6 +306,9 @@ class ChargePoint(cp):
                 # Samples integrated before the load finished are on top of
                 # the persisted total, not instead of it.
                 live.energy_kwh += restored.energy_kwh
+                live.energy_low_kwh += restored.energy_low_kwh
+                live.energy_high_kwh += restored.energy_high_kwh
+                live.step_intervals += restored.step_intervals
             else:
                 self._derived_export[conn] = restored
             if not self._derive_export_enabled():
@@ -315,6 +318,9 @@ class ChargePoint(cp):
             ]
             metric.value = round(self._derived_export[conn].energy_kwh, 6)
             metric.unit = HA_ENERGY_UNIT
+            metric.extra_attr.update(
+                self._derived_export[conn].uncertainty_attributes()
+            )
 
     def _restore_session_export(self, data) -> None:
         """Adopt a persisted session export total for the session still running.

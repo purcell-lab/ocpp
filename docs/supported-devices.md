@@ -204,6 +204,8 @@ It also adds a **Flow Direction** sensor (`import` / `export` / `idle`) from the
 
 An **Energy Session Export** sensor gives the derived export energy of the current transaction alone: it starts at zero on each StartTransaction, counts only samples belonging to that transaction, and survives a restart of the same session (not the downtime).
 
+The register also publishes how far it can be trusted: `energy_lower_bound_kwh` / `energy_upper_bound_kwh` (holding the lower / higher sample of each interval), `step_intervals` (intervals where export started or stopped, or power moved by more than 2 kW, which is where nearly all the error comes from at a 60 s sample interval) and `last_interval_s`.
+
 The derived register is an estimate from instantaneous samples, not a metered counter, and its attributes say so (`source: derived_from_negative_import`, `estimated: true`). It is persisted across restarts, but the first sample after a restart, gap or untimed sample only starts a new baseline, so downtime never adds energy. If the charger ever sends an export measurand itself, the integration logs a warning and stops deriving. The option is available for OCPP 1.6 only.
 
 Whether this charger reports discharge as negative import has not yet been confirmed on a live V2G session; check the derived sensors against an independent meter before relying on them.

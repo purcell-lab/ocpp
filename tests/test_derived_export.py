@@ -174,9 +174,26 @@ def test_register_integrates_trapezoids_and_never_bridges():
 
 def test_register_round_trip_drops_the_baseline():
     """Only the energy persists, so a restart can never bridge the downtime."""
-    reg = DerivedExportRegister(energy_kwh=1.25, last_ts=T0, last_kw=3.0)
+    reg = DerivedExportRegister(
+        energy_kwh=1.25,
+        energy_low_kwh=1.0,
+        energy_high_kwh=1.5,
+        step_intervals=2,
+        last_ts=T0,
+        last_kw=3.0,
+    )
     restored = DerivedExportRegister.from_dict(reg.to_dict())
-    assert restored == DerivedExportRegister(energy_kwh=1.25)
+    assert restored == DerivedExportRegister(
+        energy_kwh=1.25, energy_low_kwh=1.0, energy_high_kwh=1.5, step_intervals=2
+    )
+    # A total persisted before the bounds existed restores as exact.
+    legacy = DerivedExportRegister.from_dict({"energy_kwh": 0.5})
+    assert (legacy.energy_low_kwh, legacy.energy_high_kwh) == (0.5, 0.5)
+    # Inconsistent bounds are discarded rather than trusted.
+    bad = DerivedExportRegister.from_dict(
+        {"energy_kwh": 0.5, "energy_low_kwh": 0.9, "energy_high_kwh": 0.1}
+    )
+    assert (bad.energy_low_kwh, bad.energy_high_kwh) == (0.5, 0.5)
     for bad in (None, {}, {"energy_kwh": "x"}, {"energy_kwh": -1}, [1]):
         assert DerivedExportRegister.from_dict(bad) is None
     assert DerivedExportRegister.from_dict({"energy_kwh": float("inf")}) is None
@@ -340,7 +357,7 @@ async def test_register_survives_a_restart_without_bridging(hass, hass_storage):
     async_fire_time_changed(hass, datetime.now(tz=UTC).replace(year=2100))
     await hass.async_block_till_done()
     stored = hass_storage[cp._tx_store.key]["data"]["derived_export"]
-    assert stored == {"1": {"energy_kwh": pytest.approx(0.2)}}
+    assert stored["1"]["energy_kwh"] == pytest.approx(0.2)
 
     # A new process: same entry, same storage.
     cp2 = _mk_cp(hass, entry=entry)
@@ -446,9 +463,9 @@ async def test_disabled_option_keeps_but_does_not_publish_the_total(hass, hass_s
     off = _mk_cp(hass, entry=entry, derive=False)
     await _settle(hass, off)
     assert _m(off, EAER).value is None
-    assert off._tx_store_snapshot()["derived_export"] == {
-        "1": {"energy_kwh": pytest.approx(0.2)}
-    }
+    assert off._tx_store_snapshot()["derived_export"]["1"][
+        "energy_kwh"
+    ] == pytest.approx(0.2)
 
     on = _mk_cp(hass, entry=entry)
     await _settle(hass, on)
@@ -675,3 +692,60 @@ async def test_session_export_of_another_transaction_is_not_restored(
     await _settle(hass, cp)
 
     assert _m(cp, SESSION_EXPORT).value is None
+
+
+# --------------------------------------------------------------------------
+# Uncertainty
+# --------------------------------------------------------------------------
+
+
+async def test_bounds_and_steps_replay_the_live_v2g_run(hass):
+    """Replay the observed 4 October discharge and check the published bounds.
+
+    The independent inverter counter recorded 1.250 kWh. The point estimate
+    is high because export started and stopped mid-interval; the bounds
+    bracket the true value and the two step intervals are counted.
+    """
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+    readings = [  # (seconds after T0, signed W) as received from the charger
+        (0, 16527),
+        (60, -249),
+        (120, -269),
+        (180, -359),
+        (240, -229),
+        (300, -7048),
+        (361, -7269),
+        (421, -7267),
+        (481, -7332),
+        (541, -7601),
+        (601, -18819),
+        (661, -21839),
+        (721, -7),
+    ]
+    for offset, watts in readings:
+        _send(cp, T0 + timedelta(seconds=offset), *_sigen_v2g(watts))
+
+    reg = _m(cp, EAER)
+    assert reg.value == pytest.approx(1.3067, abs=0.001)
+    low = reg.extra_attr["energy_lower_bound_kwh"]
+    high = reg.extra_attr["energy_upper_bound_kwh"]
+    assert low < 1.250 < high
+    assert low <= reg.value <= high
+    # Export starting, the 0.2 -> 7 kW jump, the 7.6 -> 18.8 kW jump, the
+    # 18.8 -> 21.8 kW change and export stopping.
+    assert reg.extra_attr["step_intervals"] == 5
+    assert reg.extra_attr["last_interval_s"] == 60
+
+
+async def test_steady_export_has_tight_bounds(hass):
+    """Constant power: the bounds collapse onto the estimate, no steps."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+    for i in range(4):
+        _send(cp, T0 + timedelta(seconds=60 * i), *_sigen_v2g(-7300))
+
+    reg = _m(cp, EAER)
+    assert reg.extra_attr["energy_lower_bound_kwh"] == pytest.approx(reg.value)
+    assert reg.extra_attr["energy_upper_bound_kwh"] == pytest.approx(reg.value)
+    assert reg.extra_attr["step_intervals"] == 0

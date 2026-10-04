@@ -33,6 +33,16 @@ ATTR_METHOD = "method"
 ATTR_ESTIMATED = "estimated"
 ATTR_MAX_GAP = "max_sample_gap_s"
 ATTR_LAST_SAMPLE = "last_sample_timestamp"
+ATTR_LOWER = "energy_lower_bound_kwh"
+ATTR_UPPER = "energy_upper_bound_kwh"
+ATTR_STEPS = "step_intervals"
+ATTR_LAST_INTERVAL = "last_interval_s"
+
+# An interval is a "step" when export starts or stops inside it, or power
+# moves by more than this between its two samples. Live V2G data showed the
+# whole error against an independent counter coming from such intervals: the
+# true change happened at an unknown point between samples 60 s apart.
+STEP_KW = 2.0
 
 # Never integrate across more than this many seconds, whatever the configured
 # meter interval: a longer silence means the charger was offline or idle and
@@ -100,6 +110,12 @@ class DerivedExportRegister:
     """Lifetime export energy (kWh) integrated from export power samples."""
 
     energy_kwh: float = 0.0
+    # Bounds from holding the lower / higher sample of each interval: the
+    # true energy lies between them whenever power changed monotonically.
+    energy_low_kwh: float = 0.0
+    energy_high_kwh: float = 0.0
+    step_intervals: int = 0
+    last_interval_s: float | None = None
     last_ts: datetime | None = None
     last_kw: float | None = None
 
@@ -119,8 +135,16 @@ class DerivedExportRegister:
         if self.last_ts is not None and self.last_kw is not None:
             dt = (ts - self.last_ts).total_seconds()
             if dt <= max_gap_s:
-                added = (self.last_kw + export_kw) / 2.0 * dt / 3600.0
+                hours = dt / 3600.0
+                added = (self.last_kw + export_kw) / 2.0 * hours
                 self.energy_kwh += added
+                self.energy_low_kwh += min(self.last_kw, export_kw) * hours
+                self.energy_high_kwh += max(self.last_kw, export_kw) * hours
+                if (self.last_kw > 0) != (export_kw > 0) or abs(
+                    export_kw - self.last_kw
+                ) > STEP_KW:
+                    self.step_intervals += 1
+                self.last_interval_s = dt
 
         self.last_ts = ts
         self.last_kw = export_kw
@@ -132,8 +156,22 @@ class DerivedExportRegister:
         self.last_kw = None
 
     def to_dict(self) -> dict:
-        """Serialise the persistent part: the energy only, never the baseline."""
-        return {"energy_kwh": float(self.energy_kwh)}
+        """Serialise the persistent part: totals only, never the baseline."""
+        return {
+            "energy_kwh": float(self.energy_kwh),
+            "energy_low_kwh": float(self.energy_low_kwh),
+            "energy_high_kwh": float(self.energy_high_kwh),
+            "step_intervals": int(self.step_intervals),
+        }
+
+    def uncertainty_attributes(self) -> dict:
+        """Return the attributes that let a consumer grade the estimate."""
+        return {
+            ATTR_LOWER: round(self.energy_low_kwh, 6),
+            ATTR_UPPER: round(self.energy_high_kwh, 6),
+            ATTR_STEPS: self.step_intervals,
+            ATTR_LAST_INTERVAL: self.last_interval_s,
+        }
 
     @classmethod
     def from_dict(cls, data) -> DerivedExportRegister | None:
@@ -146,4 +184,20 @@ class DerivedExportRegister:
             return None
         if not math.isfinite(energy) or energy < 0:
             return None
-        return cls(energy_kwh=energy)
+        # Totals persisted before the bounds existed restore as exact.
+        try:
+            low = float(data.get("energy_low_kwh", energy))
+            high = float(data.get("energy_high_kwh", energy))
+            steps = int(data.get("step_intervals", 0))
+        except (TypeError, ValueError):
+            low, high, steps = energy, energy, 0
+        if not (math.isfinite(low) and math.isfinite(high)) or not (
+            0 <= low <= energy <= high
+        ):
+            low, high = energy, energy
+        return cls(
+            energy_kwh=energy,
+            energy_low_kwh=low,
+            energy_high_kwh=high,
+            step_intervals=max(steps, 0),
+        )
