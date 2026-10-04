@@ -40,6 +40,7 @@ from ocpp.messages import CallError
 from ocpp.exceptions import NotImplementedError
 
 from .derived_export import (
+    ATTR_DEADBAND,
     ATTR_ESTIMATED,
     ATTR_LAST_SAMPLE,
     ATTR_MAX_GAP,
@@ -48,7 +49,9 @@ from .derived_export import (
     DERIVED_CURRENT_METHOD,
     DERIVED_METHOD,
     DERIVED_SOURCE,
+    FLOW_DEADBAND_KW,
     DerivedExportRegister,
+    flow_direction,
     max_sample_gap,
     parse_sample_timestamp,
     split_signed,
@@ -1634,6 +1637,11 @@ class ChargePoint(cp):
             return
         _, export_kw = split_signed(signed_kw)
         metric.value = max(float(metric.value), 0.0)
+
+        direction = self._metrics[(cid, cstat.flow_direction)]
+        direction.value = flow_direction(signed_kw)
+        direction.extra_attr[ATTR_SOURCE] = DERIVED_SOURCE
+        direction.extra_attr[ATTR_DEADBAND] = FLOW_DEADBAND_KW
         export_metric = self._metrics[(cid, pae)]
         export_metric.value = (
             export_kw if metric.unit == HA_POWER_UNIT else export_kw * 1000.0

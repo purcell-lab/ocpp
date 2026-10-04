@@ -40,6 +40,27 @@ ATTR_LAST_SAMPLE = "last_sample_timestamp"
 MIN_MAX_GAP_S = 180
 
 
+# Energy flow direction, published because OCPP 1.6 connector status stays
+# Charging while a bidirectional charger discharges.
+FLOW_IMPORT = "import"
+FLOW_EXPORT = "export"
+FLOW_IDLE = "idle"
+# Readings smaller than this are treated as no flow. Observed live: -58 W at a
+# session start and -7 W after a discharge stopped, both with 0 A, while the
+# smallest genuine discharge seen (229 W) did move the inverter's counter.
+FLOW_DEADBAND_KW = 0.1
+ATTR_DEADBAND = "deadband_kw"
+
+
+def flow_direction(signed_kw: float) -> str:
+    """Classify a signed import reading as import, export or idle."""
+    if signed_kw >= FLOW_DEADBAND_KW:
+        return FLOW_IMPORT
+    if signed_kw <= -FLOW_DEADBAND_KW:
+        return FLOW_EXPORT
+    return FLOW_IDLE
+
+
 def max_sample_gap(meter_interval: int | float | None) -> float:
     """Return the longest gap two samples may span and still be integrated."""
     try:

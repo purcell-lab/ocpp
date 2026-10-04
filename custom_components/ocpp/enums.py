@@ -36,6 +36,7 @@ class HAChargerStatuses(StrEnum):
     firmware_status = "Status.Firmware"
     reconnects = "Reconnects"
     id_tag = "Id.Tag"
+    flow_direction = "Flow.Direction"
 
 
 class HAChargerDetails(StrEnum):

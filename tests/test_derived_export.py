@@ -422,7 +422,7 @@ async def test_export_sensors_exist_only_when_deriving(hass, bypass_websockets, 
 
     registry = er.async_get(hass)
     cpid = cp_cfg["cpid"]
-    for measurand in (PAE, CEX, EAER):
+    for measurand in (PAE, CEX, EAER, "Flow.Direction"):
         found = registry.async_get_entity_id(
             "sensor", DOMAIN, sensor_unique_id(cpid, measurand, None)
         )
@@ -527,3 +527,53 @@ async def test_signed_current_from_the_charger_is_preferred(hass):
 
     assert _m(cp, CEX).value == pytest.approx(60.2)
     assert _m(cp, CEX).extra_attr["estimated"] is False
+
+
+# --------------------------------------------------------------------------
+# Flow direction
+# --------------------------------------------------------------------------
+
+FLOW = "Flow.Direction"
+
+
+@pytest.mark.parametrize(
+    ("power_w", "expected"),
+    [
+        (16527, "import"),
+        (-7269, "export"),
+        (-249, "export"),  # smallest real discharge observed
+        (-58, "idle"),  # session-start noise with 0 A
+        (-7, "idle"),  # residue after the discharge stopped
+        (50, "idle"),
+    ],
+)
+async def test_flow_direction_follows_power_sign(hass, power_w, expected):
+    """Direction comes from the power sign, with a small deadband."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(power_w))
+
+    assert cp._metrics[(1, FLOW)].value == expected
+    assert cp._metrics[(1, FLOW)].extra_attr["deadband_kw"] == 0.1
+
+
+async def test_flow_direction_goes_idle_when_the_session_closes(hass):
+    """Clearing flow readings at a stop also clears the direction."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+    cp._zero_flow_measurands(1)
+
+    assert cp._metrics[(1, FLOW)].value == "idle"
+
+
+async def test_flow_direction_not_published_without_the_option(hass):
+    """Control: without the option there is no direction metric."""
+    cp = _mk_cp(hass, derive=False)
+    await _settle(hass, cp)
+
+    _send(cp, T0, *_sigen_v2g(-7269))
+
+    assert cp._metrics[(1, FLOW)].value is None

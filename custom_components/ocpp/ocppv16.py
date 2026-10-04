@@ -48,7 +48,7 @@ from .chargepoint import (
     SetVariableResult,
 )
 from .chargepoint import ChargePoint as cp
-from .derived_export import DerivedExportRegister
+from .derived_export import FLOW_IDLE, DerivedExportRegister
 
 from .enums import (
     ConfigurationKey as ckey,
@@ -2025,3 +2025,6 @@ class ChargePoint(cp):
             key = (connector_id, meas)
             if key in self._metrics:
                 self._metrics[key].value = 0
+        direction = (connector_id, cstat.flow_direction)
+        if direction in self._metrics:
+            self._metrics[direction].value = FLOW_IDLE
