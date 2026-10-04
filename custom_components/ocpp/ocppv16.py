@@ -575,6 +575,28 @@ class ChargePoint(cp):
             return by_metric[0]
         if by_metric:
             return None
+        # After a restart a session is not live again until the charger names
+        # it, and one that is never named (no transactionId on its MeterValues)
+        # would leave its own stop unattributed. The running sessions persisted
+        # before the restart identify it exactly: this connector was running
+        # this very id, and has recorded neither another one nor its end since.
+        by_store = [
+            c
+            for c, (persisted, _) in self._persisted_tx.items()
+            if persisted == tx
+            and not int(self._active_tx.get(c, 0) or 0)
+            and not self._metric_transaction(c)
+            and int(self._ended_tx.get(c, 0) or 0) != tx
+        ]
+        if len(by_store) == 1:
+            _LOGGER.info(
+                "%s: StopTransaction id=%s applied to connector %s, which was "
+                "running it before the restart",
+                self.id,
+                tx,
+                by_store[0],
+            )
+            return by_store[0]
         live = self._live_connectors()
         if len(live) == 1:
             _LOGGER.info(
@@ -1769,13 +1791,13 @@ class ChargePoint(cp):
                     value = None
             self._metrics[ms_key].value = value
 
-        if connector_id == 0 and self._metrics[tx_key].value is None:
-            # Nor may connector 0 restore one: its HA fallback is the flattened
-            # sensor, which on a single-connector charger shows connector 1's
-            # session.
-            self._metrics[tx_key].value = 0
-
-        if self._metrics[tx_key].value is None:
+        # Nor may connector 0 restore one: its HA fallback is the flattened
+        # sensor, which on a single-connector charger shows connector 1's
+        # session. Its metric is left unset rather than settled to 0: the
+        # flattened sensor reads connector 0 first, so a 0 there would show no
+        # transaction while connector 1 charges, and connector 1 would restore
+        # that 0 after the next restart and lose its running session.
+        if connector_id != 0 and self._metrics[tx_key].value is None:
             value = self.get_ha_metric(csess.transaction_id, connector_id)
             if value is None:
                 # A first sighting normally restores a transaction after a
