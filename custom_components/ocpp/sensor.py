@@ -129,6 +129,7 @@ async def async_setup_entry(hass, entry, async_add_devices):
             DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
         ):
             CONNECTOR_ONLY.append(HAChargerStatuses.flow_direction)
+            CONNECTOR_ONLY.append(HAChargerSession.session_energy_export)
 
         def _mk_desc(metric: str, *, cat_diag: bool = False) -> OcppSensorDescription:
             ms = str(metric).strip()

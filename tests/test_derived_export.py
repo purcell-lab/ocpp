@@ -422,7 +422,7 @@ async def test_export_sensors_exist_only_when_deriving(hass, bypass_websockets, 
 
     registry = er.async_get(hass)
     cpid = cp_cfg["cpid"]
-    for measurand in (PAE, CEX, EAER, "Flow.Direction"):
+    for measurand in (PAE, CEX, EAER, "Flow.Direction", "Energy.Session.Export"):
         found = registry.async_get_entity_id(
             "sensor", DOMAIN, sensor_unique_id(cpid, measurand, None)
         )
@@ -577,3 +577,101 @@ async def test_flow_direction_not_published_without_the_option(hass):
     _send(cp, T0, *_sigen_v2g(-7269))
 
     assert cp._metrics[(1, FLOW)].value is None
+
+
+# --------------------------------------------------------------------------
+# Per-session export energy
+# --------------------------------------------------------------------------
+
+SESSION_EXPORT = "Energy.Session.Export"
+
+
+def _send_tx(cp: ChargePoint, tx: int, ts: datetime, *samples: dict) -> None:
+    cp.on_meter_values(
+        connector_id=1,
+        meter_value=[{"timestamp": ts.isoformat(), "sampled_value": list(samples)}],
+        transaction_id=tx,
+    )
+
+
+async def test_session_export_counts_only_this_transaction(hass):
+    """Export before a session starts is not billed to it; a new one resets."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    # Outside any transaction: the lifetime register moves, no session does.
+    _send(cp, T0, *_sigen_v2g(-12000))
+    _send(cp, T0 + timedelta(seconds=60), *_sigen_v2g(-12000))
+    assert _m(cp, EAER).value == pytest.approx(0.2)
+
+    tx = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    assert _m(cp, SESSION_EXPORT).value == 0.0
+
+    _send_tx(cp, tx, T0 + timedelta(seconds=120), *_sigen_v2g(-12000))
+    _send_tx(cp, tx, T0 + timedelta(seconds=180), *_sigen_v2g(-12000))
+    assert _m(cp, SESSION_EXPORT).value == pytest.approx(0.4)
+    assert _m(cp, SESSION_EXPORT).extra_attr["estimated"] is True
+    assert _m(cp, EAER).value == pytest.approx(0.6)
+
+    second = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    assert second != tx
+    assert _m(cp, SESSION_EXPORT).value == 0.0
+
+
+async def test_session_export_survives_a_restart_of_the_same_session(
+    hass, hass_storage
+):
+    """A running session keeps its total across a restart; downtime adds none."""
+    entry = _mk_entry(hass)
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+    tx = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
+    async_fire_time_changed(hass, datetime.now(tz=UTC).replace(year=2100))
+    await hass.async_block_till_done()
+    _send_tx(cp, tx, T0, *_sigen_v2g(-12000))
+    _send_tx(cp, tx, T0 + timedelta(seconds=60), *_sigen_v2g(-12000))
+    async_fire_time_changed(hass, datetime.now(tz=UTC).replace(year=2101))
+    await hass.async_block_till_done()
+    stored = hass_storage[cp._tx_store.key]["data"]["derived_session_export"]
+    assert stored == {"1": {"tx_id": tx, "energy_kwh": pytest.approx(0.2)}}
+
+    cp2 = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp2)
+    assert _m(cp2, SESSION_EXPORT).value == pytest.approx(0.2)
+
+
+async def test_session_export_of_another_transaction_is_not_restored(
+    hass, hass_storage
+):
+    """A total recorded for a different transaction never carries over."""
+    entry = _mk_entry(hass)
+    key = ChargePoint(
+        CP_ID,
+        SimpleNamespace(state=State.CLOSED, close=lambda: asyncio.sleep(0)),
+        hass,
+        entry,
+        CentralSystemSettings(**entry.data),
+        ChargerSystemSettings(
+            cpid="test_cpid",
+            max_current=32,
+            idle_interval=60,
+            meter_interval=60,
+            monitored_variables="",
+            monitored_variables_autoconfig=False,
+            skip_schema_validation=False,
+            force_smart_charging=False,
+        ),
+    )._tx_store.key
+    hass_storage[key] = {
+        "version": 1,
+        "key": key,
+        "data": {
+            "last_tx_id": 4242,
+            "connectors": {"1": {"tx_id": 4242, "started_at": 1_800_000_000.0}},
+            "derived_session_export": {"1": {"tx_id": 1111, "energy_kwh": 3.5}},
+        },
+    }
+    cp = _mk_cp(hass, entry=entry)
+    await _settle(hass, cp)
+
+    assert _m(cp, SESSION_EXPORT).value is None

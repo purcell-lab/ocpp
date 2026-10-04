@@ -61,6 +61,7 @@ class HAChargerSession(StrEnum):
     session_time = "Time.Session"  # in min
     session_energy = "Energy.Session"  # in kWh
     meter_start = "Energy.Meter.Start"  # in kWh
+    session_energy_export = "Energy.Session.Export"  # in kWh, derived
 
 
 class Profiles(IntFlag):

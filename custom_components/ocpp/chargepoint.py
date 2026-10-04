@@ -334,6 +334,8 @@ class ChargePoint(cp):
         self._charger_reports_session_energy = False
         # connector_id -> export energy derived from negative import
         self._derived_export: dict[int, DerivedExportRegister] = {}
+        # connector_id -> derived export energy of the current session (kWh)
+        self._derived_session_export: dict[int, float] = {}
         # Once the charger sends any export measurand itself, stop deriving.
         self._native_export_seen = False
 
@@ -1550,7 +1552,9 @@ class ChargePoint(cp):
                     if timestamps is not None and bucket_idx < len(timestamps)
                     else None
                 )
-                self._derive_export_from_bucket(bucket, connector_id, raw_ts)
+                self._derive_export_from_bucket(
+                    bucket, connector_id, raw_ts, is_transaction
+                )
 
     # ------------------------------------------------------------------
     # Export derived from negative import (derive_export_from_negative_import)
@@ -1584,7 +1588,9 @@ class ChargePoint(cp):
             return 1 if n_connectors == 1 else 0
         return int(connector_id)
 
-    def _derive_export_from_bucket(self, bucket, connector_id, raw_ts) -> None:
+    def _derive_export_from_bucket(
+        self, bucket, connector_id, raw_ts, is_transaction: bool = False
+    ) -> None:
         """Split signed import flows into import/export and integrate export power."""
         reported = {sv.measurand for sv in bucket}
         native = reported & _NATIVE_EXPORT_MEASURANDS
@@ -1686,8 +1692,30 @@ class ChargePoint(cp):
                 ATTR_LAST_SAMPLE: ts.isoformat(),
             }
         )
+        if is_transaction:
+            # Per-session total: the energy this transaction's own samples
+            # integrated, so a session never inherits export from before it
+            # started or across a restart gap.
+            session = self._derived_session_export.get(cid, 0.0) + added
+            self._derived_session_export[cid] = session
+            self._set_session_export(cid, session)
         if added > 0:
             self._on_derived_export_changed()
+
+    def _set_session_export(self, cid: int, energy_kwh: float) -> None:
+        """Publish the connector's derived export energy for this session."""
+        metric = self._metrics[(cid, csess.session_energy_export)]
+        metric.value = round(energy_kwh, 6)
+        metric.unit = HA_ENERGY_UNIT
+        metric.extra_attr[ATTR_SOURCE] = DERIVED_SOURCE
+        metric.extra_attr[ATTR_ESTIMATED] = True
+
+    def _reset_session_export(self, cid: int) -> None:
+        """Start a new session's derived export total at zero."""
+        if not self._derive_export_enabled():
+            return
+        self._derived_session_export[cid] = 0.0
+        self._set_session_export(cid, 0.0)
 
     def _set_derived_current(self, cid: int, amps: float, source, *, estimated: bool):
         """Publish Current.Export, labelled with how it was obtained."""

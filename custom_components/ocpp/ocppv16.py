@@ -281,6 +281,7 @@ class ChargePoint(cp):
                 "start_time_estimated"
             ):
                 self._set_session_start(conn, started, estimated=False)
+        self._restore_session_export(data.get("derived_session_export"))
 
     def _restore_derived_export(self, data) -> None:
         """Adopt persisted derived export registers.
@@ -314,6 +315,31 @@ class ChargePoint(cp):
             ]
             metric.value = round(self._derived_export[conn].energy_kwh, 6)
             metric.unit = HA_ENERGY_UNIT
+
+    def _restore_session_export(self, data) -> None:
+        """Adopt a persisted session export total for the session still running.
+
+        Only a total recorded for the transaction persisted as running on that
+        connector is restored, so a finished or different session can never
+        inherit it.
+        """
+        if not isinstance(data, dict) or not self._derive_export_enabled():
+            return
+        for key, item in data.items():
+            try:
+                conn = int(key)
+                tx = int(item["tx_id"])
+                energy = float(item["energy_kwh"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(energy) or energy < 0:
+                continue
+            persisted = self._persisted_tx.get(conn)
+            if persisted is None or persisted[0] != tx:
+                continue
+            total = self._derived_session_export.get(conn, 0.0) + energy
+            self._derived_session_export[conn] = total
+            self._set_session_export(conn, total)
 
     def _on_derived_export_changed(self) -> None:
         """Persist the derived export register with the transaction state."""
@@ -353,6 +379,13 @@ class ChargePoint(cp):
                 str(conn): register.to_dict()
                 for conn, register in self._derived_export.items()
             }
+        session_export = {
+            str(conn): {"tx_id": int(self._active_tx[conn]), "energy_kwh": energy}
+            for conn, energy in self._derived_session_export.items()
+            if self._active_tx.get(conn)
+        }
+        if session_export:
+            snapshot["derived_session_export"] = session_export
         return snapshot
 
     def _schedule_tx_store_save(self) -> None:
@@ -1917,6 +1950,7 @@ class ChargePoint(cp):
             self._metrics[(connector_id, csess.session_time)].unit = UnitOfTime.MINUTES
             self._metrics[(connector_id, csess.session_energy)].value = 0.0
             self._metrics[(connector_id, csess.session_energy)].unit = HA_ENERGY_UNIT
+            self._reset_session_export(connector_id)
 
             self._schedule_tx_store_save()
             self._report_transaction_start(connector_id, tx_id, connector_id)

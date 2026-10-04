@@ -202,6 +202,8 @@ The charger sends no `*.Export.*` measurand, so Home Assistant has no export fig
 
 It also adds a **Flow Direction** sensor (`import` / `export` / `idle`) from the sign of `Power.Active.Import`, with a 0.1 kW deadband, because the connector status stays `Charging` while the EVDC discharges. It returns to `idle` when the session's flow readings are cleared.
 
+An **Energy Session Export** sensor gives the derived export energy of the current transaction alone: it starts at zero on each StartTransaction, counts only samples belonging to that transaction, and survives a restart of the same session (not the downtime).
+
 The derived register is an estimate from instantaneous samples, not a metered counter, and its attributes say so (`source: derived_from_negative_import`, `estimated: true`). It is persisted across restarts, but the first sample after a restart, gap or untimed sample only starts a new baseline, so downtime never adds energy. If the charger ever sends an export measurand itself, the integration logs a warning and stops deriving. The option is available for OCPP 1.6 only.
 
 Whether this charger reports discharge as negative import has not yet been confirmed on a live V2G session; check the derived sensors against an independent meter before relying on them.
