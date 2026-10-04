@@ -64,6 +64,7 @@ from .const import (
     DEFAULT_NUM_CONNECTORS,
     DEFAULT_POWER_UNIT,
     DEFAULT_MEASURAND,
+    DEFAULT_MONITORED_VARIABLES,
     DOMAIN,
     HA_ENERGY_UNIT,
     HA_POWER_UNIT,
@@ -72,12 +73,20 @@ from .const import (
 )
 
 TIME_MINUTES = UnitOfTime.MINUTES
+
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 # Seconds before monitor_connection starts post_connect for chargers that
 # never send a boot notification. Module-level so tests can shrink it
 # without monkeypatching asyncio.sleep globally.
 MONITOR_BACKSTOP_DELAY = 10
+
+
+def _measurand_set(csv: str) -> frozenset[str]:
+    """Return the measurands in a comma-separated list, ignoring order."""
+    return frozenset(m.strip() for m in csv.split(",") if m.strip())
+
+
 _DEFAULT_LINE_VOLTAGE = 230.0
 _DEFAULT_PHASES = 1
 _PHASE_KEY_GROUPS = (
@@ -367,6 +376,82 @@ class ChargePoint(cp):
             "Feature profiles returned: %s", self._attr_supported_features.labels()
         )
 
+    def _store_detected_settings(self, accepted_measurands: str):
+        """Persist the detected measurands and connector count for this charger.
+
+        A charger that cannot report or accept MeterValuesSampledData (unknown
+        key, NotSupported) yields an empty list. Storing that would leave
+        sensor.py with no measurand sensors after the next reload, although
+        the charger keeps sending those measurands in MeterValues, and it
+        would silently discard a list the user picked by hand. So an empty
+        result never replaces a stored list; with nothing stored either, all
+        measurands are stored so a sensor exists for whatever the charger
+        sends. This applies with autoconfig on or off: autoconfig only
+        decides whether the integration tries to set the list, and with
+        nothing usable detected there is nothing better to store.
+        """
+        cpids = self.entry.data.get(CONF_CPIDS, [])
+        for i, item in enumerate(cpids):
+            if self.id not in item:
+                continue
+            stored = item[self.id]
+            stored_measurands = str(stored.get(CONF_MONITORED_VARIABLES) or "")
+            measurands = accepted_measurands
+            if not measurands and stored_measurands:
+                _LOGGER.debug(
+                    "'%s' charger did not report or accept measurands; keeping "
+                    "the configured list: %s",
+                    self.id,
+                    stored_measurands,
+                )
+                measurands = stored_measurands
+            elif not measurands:
+                # Logged at info: this changes the entry and reloads it.
+                _LOGGER.info(
+                    "'%s' charger did not report or accept measurands and none "
+                    "are configured; monitoring all measurands",
+                    self.id,
+                )
+                measurands = DEFAULT_MONITORED_VARIABLES
+            if _measurand_set(measurands) == _measurand_set(stored_measurands):
+                # Same measurands in another order (the 1.6 and 2.0.1 lists
+                # are ordered differently): not a change worth a reload.
+                measurands = stored_measurands
+            num_connectors = int(self.num_connectors)
+            if (
+                stored.get(CONF_MONITORED_VARIABLES) == measurands
+                and stored.get(CONF_NUM_CONNECTORS) == num_connectors
+            ):
+                return
+            # Build new containers rather than editing entry.data in place:
+            # async_update_entry compares against the current data, so an
+            # in-place edit looks unchanged and is neither saved nor reloaded,
+            # leaving memory and disk out of step.
+            new_cpids = list(cpids)
+            new_cpids[i] = {
+                **item,
+                self.id: {
+                    **stored,
+                    CONF_MONITORED_VARIABLES: measurands,
+                    CONF_NUM_CONNECTORS: num_connectors,
+                },
+            }
+            _LOGGER.debug(
+                "'%s' saving detected settings (connectors %s -> %s, "
+                "measurands %s -> %s); the entry will reload",
+                self.id,
+                stored.get(CONF_NUM_CONNECTORS),
+                num_connectors,
+                stored_measurands,
+                measurands,
+            )
+            # The entry differs, so this will unload/reload and stop/restart
+            # the central system/websocket.
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, CONF_CPIDS: new_cpids}
+            )
+            return
+
     async def post_connect(self):
         """Logic to be executed right after a charger connects."""
         try:
@@ -380,18 +465,7 @@ class ChargePoint(cp):
             await self.get_heartbeat_interval()
 
             accepted_measurands: str = await self.get_supported_measurands()
-            updated_entry = {**self.entry.data}
-            for i in range(len(updated_entry[CONF_CPIDS])):
-                if self.id in updated_entry[CONF_CPIDS][i]:
-                    s = updated_entry[CONF_CPIDS][i][self.id]
-                    if s.get(CONF_MONITORED_VARIABLES) != accepted_measurands or s.get(
-                        CONF_NUM_CONNECTORS
-                    ) != int(self.num_connectors):
-                        s[CONF_MONITORED_VARIABLES] = accepted_measurands
-                        s[CONF_NUM_CONNECTORS] = int(self.num_connectors)
-                    break
-            # if an entry differs this will unload/reload and stop/restart the central system/websocket
-            self.hass.config_entries.async_update_entry(self.entry, data=updated_entry)
+            self._store_detected_settings(accepted_measurands)
 
             await self.set_standard_configuration()
 

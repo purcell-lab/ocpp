@@ -27,6 +27,7 @@ from custom_components.ocpp.const import (
     DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
     DEFAULT_ENABLE_HA_NOTIFICATIONS,
     DEFAULT_MONITORED_VARIABLES,
+    DEFAULT_NUM_CONNECTORS,
 )
 
 MOCK_CONFIG_CS = {
@@ -109,6 +110,10 @@ MOCK_CONFIG_CP_APPEND = {
     CONF_METER_INTERVAL: 60,
     CONF_MONITORED_VARIABLES: DEFAULT_MONITORED_VARIABLES,
     CONF_MONITORED_VARIABLES_AUTOCONFIG: True,
+    # The config flow always stores the detected count. Without it every
+    # charger's first post_connect saves one, reloading the entry and
+    # dropping the test's connection.
+    CONF_NUM_CONNECTORS: DEFAULT_NUM_CONNECTORS,
     CONF_SKIP_SCHEMA_VALIDATION: False,
     CONF_FORCE_SMART_CHARGING: True,
     CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE: DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,

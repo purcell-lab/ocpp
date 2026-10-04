@@ -7,7 +7,12 @@ from datetime import datetime, UTC
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.ocpp.const import CONF_CPIDS, CONF_CPID
+from custom_components.ocpp.const import (
+    CONF_CPID,
+    CONF_CPIDS,
+    CONF_MONITORED_VARIABLES,
+    CONF_NUM_CONNECTORS,
+)
 from custom_components.ocpp.const import (
     DOMAIN as OCPP_DOMAIN,
 )
@@ -291,6 +296,12 @@ async def test_v201_multi_connectors_per_evse(hass, socket_enabled):
     config_data = copy.deepcopy(MOCK_CONFIG_DATA)
     config_data[CONF_CPIDS].append({cp_id: copy.deepcopy(MOCK_CONFIG_CP_APPEND)})
     config_data[CONF_CPIDS][-1][cp_id][CONF_CPID] = "test_v201_cpid"
+    # Store what the charger below reports, so post_connect has nothing to
+    # save: a real change reloads the entry and drops this connection.
+    config_data[CONF_CPIDS][-1][cp_id][CONF_NUM_CONNECTORS] = 3
+    config_data[CONF_CPIDS][-1][cp_id][CONF_MONITORED_VARIABLES] = (
+        "Energy.Active.Import.Register,Current.Import,Voltage"
+    )
 
     config_entry = MockConfigEntry(
         domain=OCPP_DOMAIN,

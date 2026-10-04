@@ -9,7 +9,12 @@ import pytest
 import websockets
 
 from custom_components.ocpp.api import CentralSystem
-from custom_components.ocpp.const import CONF_CPIDS, CONF_PORT, DOMAIN as OCPP_DOMAIN
+from custom_components.ocpp.const import (
+    CONF_CPIDS,
+    CONF_NUM_CONNECTORS,
+    CONF_PORT,
+    DOMAIN as OCPP_DOMAIN,
+)
 from tests.const import MOCK_CONFIG_CP_APPEND, MOCK_CONFIG_DATA
 from .charge_point_test import (
     create_configuration,
@@ -108,6 +113,13 @@ async def setup_config_entry(hass, request) -> AsyncGenerator[CentralSystem, Non
     config_data[CONF_CPIDS].append(
         {request.param["cp_id"]: copy.deepcopy(MOCK_CONFIG_CP_APPEND)}
     )
+    if "num_connectors" in request.param:
+        # Store the connector count the test charger will report. post_connect
+        # saves a differing count, which reloads the entry and drops the
+        # test's websocket mid-scenario.
+        config_data[CONF_CPIDS][-1][request.param["cp_id"]][CONF_NUM_CONNECTORS] = (
+            request.param["num_connectors"]
+        )
     config_data[CONF_PORT] = request.param["port"]
     config_entry = MockConfigEntry(
         domain=OCPP_DOMAIN,
