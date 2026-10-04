@@ -15,9 +15,15 @@ from homeassistant.components.persistent_notification import DOMAIN as PN_DOMAIN
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.const import STATE_OK, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import (
+    ATTR_UNIT_OF_MEASUREMENT,
+    STATE_OK,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.const import UnitOfTime
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
+from homeassistant.components.sensor import UNIT_CONVERTERS
 from homeassistant.helpers import device_registry, entity_registry
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from websockets.asyncio.server import ServerConnection
@@ -1528,8 +1534,19 @@ class ChargePoint(cp):
             return flags
         return self._attr_supported_features
 
-    def get_ha_metric(self, measurand: str, connector_id: int | None = None):
-        """Return last known value in HA for given measurand, or None if not available."""
+    def get_ha_metric(
+        self,
+        measurand: str,
+        connector_id: int | None = None,
+        unit: str | None = None,
+    ):
+        """Return last known value in HA for given measurand, or None if not available.
+
+        The HA state is what the user sees, so it is in their chosen display
+        unit, not necessarily the unit the integration works in. When ``unit``
+        is given, a state shown in another unit is converted back to it, and
+        one that cannot be converted is not restored at all.
+        """
         base = self.settings.cpid.lower()
         meas_slug = measurand.lower().replace(".", "_")
 
@@ -1549,8 +1566,32 @@ class ChargePoint(cp):
                 st = None
 
             if st and st.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN, None):
-                return st.state
+                if unit is None:
+                    return st.state
+                return self._ha_state_in_unit(entity_id, st, unit)
 
+        return None
+
+    @staticmethod
+    def _ha_state_in_unit(entity_id: str, st, unit: str):
+        """Return an HA state's value in ``unit``, or None if it cannot be."""
+        shown = st.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+        # HA only converts a state that has a unit, so one without is native.
+        if shown in (None, unit):
+            return st.state
+        for converter in set(UNIT_CONVERTERS.values()):
+            if shown in converter.VALID_UNITS and unit in converter.VALID_UNITS:
+                try:
+                    return converter.convert(float(st.state), shown, unit)
+                except (ValueError, TypeError):
+                    break
+        _LOGGER.debug(
+            "Not restoring %s: state %s %s cannot be expressed in %s",
+            entity_id,
+            st.state,
+            shown,
+            unit,
+        )
         return None
 
     async def notify_ha(self, msg: str, title: str = "Ocpp integration"):

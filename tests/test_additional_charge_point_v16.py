@@ -609,7 +609,7 @@ async def test_restore_meter_start_cast_exception(
             # Force metric slot to look missing
             srv._metrics[(1, "Energy.Meter.Start")].value = None
 
-            def fake_get_ha_metric(name, connector_id=None):
+            def fake_get_ha_metric(name, connector_id=None, unit=None):
                 if name == "Energy.Meter.Start" and connector_id == 1:
                     return "not-a-float"
                 return None
@@ -669,7 +669,7 @@ async def test_restore_transaction_id_cast_exception(
             srv = cs.charge_points[cp_id]
             srv._metrics[(1, "Transaction.Id")].value = None
 
-            def fake_get_ha_metric(name, connector_id=None):
+            def fake_get_ha_metric(name, connector_id=None, unit=None):
                 if name == "Transaction.Id" and connector_id == 1:
                     return "not-an-int"
                 return None

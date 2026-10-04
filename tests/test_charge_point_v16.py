@@ -974,7 +974,9 @@ async def test_on_meter_values_restore_paths_v16(
         srv._metrics[(1, "Transaction.Id")].value = None
 
         # Patch get_ha_metric so both restores succeed.
-        def fake_get_ha_metric(name: str, connector_id: int | None = None):
+        def fake_get_ha_metric(
+            name: str, connector_id: int | None = None, unit: str | None = None
+        ):
             if name == "Energy.Meter.Start" and connector_id == 1:
                 return "12.5"  # kWh
             if name == "Transaction.Id" and connector_id == 1:
