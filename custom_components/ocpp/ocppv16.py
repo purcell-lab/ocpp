@@ -1750,7 +1750,9 @@ class ChargePoint(cp):
         session_key = (connector_id, csess.session_time)
 
         if self._metrics[ms_key].value is None:
-            value = self.get_ha_metric(csess.meter_start, connector_id)
+            value = self.get_ha_metric(
+                csess.meter_start, connector_id, unit=HA_ENERGY_UNIT
+            )
             if value is None:
                 m = self._metrics.get((connector_id, DEFAULT_MEASURAND))
                 value = m.value if m is not None else None

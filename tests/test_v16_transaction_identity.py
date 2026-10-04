@@ -525,7 +525,7 @@ async def test_a_restored_id_is_not_handed_out_again(hass, frozen_time, monkeypa
     cp = _mk_cp(hass)
     await _settle(hass, cp)
 
-    def restored(metric, connector_id=None):
+    def restored(metric, connector_id=None, unit=None):
         return int(NOW) if metric == csess.transaction_id else None
 
     monkeypatch.setattr(cp, "get_ha_metric", restored)
