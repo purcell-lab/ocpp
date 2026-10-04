@@ -690,7 +690,14 @@ async def test_cms_responses_errors_v16(
 @pytest.mark.timeout(40)  # Set timeout for this test
 @pytest.mark.parametrize(
     "setup_config_entry",
-    [{"port": 9007, "cp_id": "CP_1_norm_mc", "cms": "cms_norm"}],
+    [
+        {
+            "port": 9007,
+            "cp_id": "CP_1_norm_mc",
+            "cms": "cms_norm",
+            "num_connectors": 2,
+        }
+    ],
     indirect=True,
 )
 @pytest.mark.parametrize("cp_id", ["CP_1_norm_mc"])
@@ -1308,7 +1315,14 @@ async def test_update_firmware_rpc_failure_v16(
 @pytest.mark.timeout(40)
 @pytest.mark.parametrize(
     "setup_config_entry",
-    [{"port": 9020, "cp_id": "CP_1_unit_fallback", "cms": "cms_unit_fallback"}],
+    [
+        {
+            "port": 9020,
+            "cp_id": "CP_1_unit_fallback",
+            "cms": "cms_unit_fallback",
+            "num_connectors": 3,
+        }
+    ],
     indirect=True,
 )
 @pytest.mark.parametrize("cp_id", ["CP_1_unit_fallback"])
@@ -1367,6 +1381,7 @@ async def test_api_get_unit_fallback_to_later_connectors(
             "port": 9019,
             "cp_id": "CP_1_extra_fallback",
             "cms": "cms_extra_fallback",
+            "num_connectors": 3,
         }
     ],
     indirect=True,
