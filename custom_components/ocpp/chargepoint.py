@@ -1683,6 +1683,10 @@ class ChargePoint(cp):
         export_metric.unit = metric.unit
         export_metric.extra_attr.update(derived_attrs)
         export_metric.extra_attr[om.context] = metric.extra_attr.get(om.context)
+        if om.context_source in metric.extra_attr:
+            export_metric.extra_attr[om.context_source] = metric.extra_attr[
+                om.context_source
+            ]
 
         # Some chargers (the Sigenergy EVDC among them) report Current.Import
         # as 0 A rather than negative while discharging, so the current split
@@ -1809,6 +1813,8 @@ class ChargePoint(cp):
         else:
             cex.extra_attr.pop(ATTR_METHOD, None)
         cex.extra_attr[om.context] = source.extra_attr.get(om.context)
+        if om.context_source in source.extra_attr:
+            cex.extra_attr[om.context_source] = source.extra_attr[om.context_source]
 
     def _export_amps_from_power(self, bucket, cid: int, export_kw: float):
         """Return export amps from power and this reading's voltage, or None."""

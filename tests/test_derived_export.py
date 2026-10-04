@@ -912,3 +912,22 @@ async def test_unusable_reference_is_reported_not_guessed(hass, state, unit):
     attrs = _m(cp, EAER).extra_attr
     assert attrs["reference_status"] == "unavailable"
     assert "divergence_kwh" not in attrs
+
+
+async def test_derived_flows_carry_the_context_source(hass):
+    """Derived export metrics say whether the context came from the charger."""
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    # Exactly as the EVDC sends it: value, measurand and unit, no context.
+    _send(
+        cp,
+        T0,
+        {"measurand": PAI, "value": "-7269", "unit": "W"},
+        {"measurand": CUR, "value": "0.00", "unit": "A"},
+        {"measurand": Measurand.voltage.value, "value": "392.1", "unit": "V"},
+    )
+
+    for measurand in (PAE, CEX):
+        assert _m(cp, measurand).extra_attr["context"] == "Sample.Periodic"
+        assert _m(cp, measurand).extra_attr["context_source"] == "defaulted"
