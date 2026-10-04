@@ -20,6 +20,7 @@ from homeassistant.const import UnitOfTime
 from homeassistant.components.sensor import DOMAIN as SENSOR_DOMAIN
 from homeassistant.helpers import device_registry, entity_registry
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.util.unit_conversion import EnergyConverter
 from websockets.asyncio.server import ServerConnection
 from websockets.exceptions import WebSocketException
 from websockets.protocol import State
@@ -41,6 +42,12 @@ from ocpp.exceptions import NotImplementedError
 
 from .derived_export import (
     ATTR_DEADBAND,
+    ATTR_DERIVED_DELTA,
+    ATTR_DIVERGENCE,
+    ATTR_DIVERGENCE_PCT,
+    ATTR_REFERENCE_DELTA,
+    ATTR_REFERENCE_ENTITY,
+    ATTR_REFERENCE_STATUS,
     ATTR_ESTIMATED,
     ATTR_LAST_SAMPLE,
     ATTR_MAX_GAP,
@@ -334,6 +341,8 @@ class ChargePoint(cp):
         self._charger_reports_session_energy = False
         # connector_id -> export energy derived from negative import
         self._derived_export: dict[int, DerivedExportRegister] = {}
+        # connector_id -> (reference kWh, derived kWh) at the first comparison
+        self._reference_baseline: dict[int, tuple[float, float]] = {}
         # connector_id -> derived export energy of the current session (kWh)
         self._derived_session_export: dict[int, float] = {}
         # Once the charger sends any export measurand itself, stop deriving.
@@ -1694,6 +1703,7 @@ class ChargePoint(cp):
                 **register.uncertainty_attributes(),
             }
         )
+        self._update_reference_divergence(cid, reg_metric, register)
         if is_transaction:
             # Per-session total: the energy this transaction's own samples
             # integrated, so a session never inherits export from before it
@@ -1703,6 +1713,56 @@ class ChargePoint(cp):
             self._set_session_export(cid, session)
         if added > 0:
             self._on_derived_export_changed()
+
+    def _update_reference_divergence(self, cid: int, reg_metric, register) -> None:
+        """Compare the derived register with an optional reference counter.
+
+        Diagnostic only, for commissioning: the derived values never depend on
+        the reference. Both are compared as deltas from the first reading
+        taken after start-up, so the reference's lifetime offset is irrelevant.
+        """
+        entity_id = str(
+            getattr(self.settings, "export_reference_entity", "") or ""
+        ).strip()
+        if not entity_id:
+            return
+        reference_kwh = self._reference_energy_kwh(entity_id)
+        attrs = reg_metric.extra_attr
+        attrs[ATTR_REFERENCE_ENTITY] = entity_id
+        if reference_kwh is None:
+            attrs[ATTR_REFERENCE_STATUS] = "unavailable"
+            return
+        baseline = self._reference_baseline.get(cid)
+        if baseline is None:
+            baseline = (reference_kwh, register.energy_kwh)
+            self._reference_baseline[cid] = baseline
+        reference_delta = reference_kwh - baseline[0]
+        derived_delta = register.energy_kwh - baseline[1]
+        attrs[ATTR_REFERENCE_STATUS] = "ok"
+        attrs[ATTR_REFERENCE_DELTA] = round(reference_delta, 6)
+        attrs[ATTR_DERIVED_DELTA] = round(derived_delta, 6)
+        attrs[ATTR_DIVERGENCE] = round(derived_delta - reference_delta, 6)
+        attrs[ATTR_DIVERGENCE_PCT] = (
+            round(100.0 * (derived_delta - reference_delta) / reference_delta, 2)
+            if reference_delta > 0
+            else None
+        )
+
+    def _reference_energy_kwh(self, entity_id: str) -> float | None:
+        """Read the reference entity as kWh, converting its unit; None if unusable."""
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        try:
+            return EnergyConverter.convert(
+                value, state.attributes.get("unit_of_measurement"), HA_ENERGY_UNIT
+            )
+        except HomeAssistantError:
+            return None
 
     def _set_session_export(self, cid: int, energy_kwh: float) -> None:
         """Publish the connector's derived export energy for this session."""

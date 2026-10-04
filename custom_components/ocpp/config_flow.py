@@ -18,6 +18,7 @@ from .const import (
     CONF_CPIDS,
     CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
     CONF_EXPORT_METER_INTERVAL,
+    CONF_EXPORT_REFERENCE_ENTITY,
     CONF_CSID,
     CONF_ENABLE_HA_NOTIFICATIONS,
     CONF_FORCE_SMART_CHARGING,
@@ -43,6 +44,7 @@ from .const import (
     DEFAULT_CSID,
     DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
     DEFAULT_EXPORT_METER_INTERVAL,
+    DEFAULT_EXPORT_REFERENCE_ENTITY,
     DEFAULT_ENABLE_HA_NOTIFICATIONS,
     DEFAULT_FORCE_SMART_CHARGING,
     DEFAULT_HOST,
@@ -121,6 +123,9 @@ STEP_USER_CP_DATA_SCHEMA = vol.Schema(
         vol.Required(
             CONF_EXPORT_METER_INTERVAL, default=DEFAULT_EXPORT_METER_INTERVAL
         ): int,
+        vol.Optional(
+            CONF_EXPORT_REFERENCE_ENTITY, default=DEFAULT_EXPORT_REFERENCE_ENTITY
+        ): str,
         vol.Required(
             CONF_ENABLE_HA_NOTIFICATIONS, default=DEFAULT_ENABLE_HA_NOTIFICATIONS
         ): bool,
@@ -492,6 +497,12 @@ class OCPPOptionsFlow(OptionsFlow):
                         CONF_EXPORT_METER_INTERVAL, DEFAULT_EXPORT_METER_INTERVAL
                     ),
                 ): int,
+                vol.Optional(
+                    CONF_EXPORT_REFERENCE_ENTITY,
+                    default=current.get(
+                        CONF_EXPORT_REFERENCE_ENTITY, DEFAULT_EXPORT_REFERENCE_ENTITY
+                    ),
+                ): str,
                 vol.Required(
                     CONF_ENABLE_HA_NOTIFICATIONS,
                     default=current.get(

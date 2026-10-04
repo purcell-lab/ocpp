@@ -208,6 +208,8 @@ The register also publishes how far it can be trusted: `energy_lower_bound_kwh` 
 
 While exporting, the integration asks the charger for a faster `MeterValueSampleInterval` (**Meter sample interval while exporting**, default 10 s; 0 disables) and returns it to the normal meter interval after five samples without export or when the session stops. Re-sampling a live V2G run showed 60 s sampling is only good to about 15 % on a stepped discharge, against about 2 % at 10 s. A charger that refuses the change is left at its normal interval, with one warning.
 
+For commissioning, **Optional reference export energy entity** can name an independent cumulative export/discharge energy sensor (for example the inverter's own DC-charger discharge counter). The derived register then publishes `reference_delta_kwh`, `derived_delta_kwh`, `divergence_kwh` and `divergence_pct`, measured from the first comparison after start-up, with the reference's unit converted. The derived values never use the reference.
+
 The derived register is an estimate from instantaneous samples, not a metered counter, and its attributes say so (`source: derived_from_negative_import`, `estimated: true`). It is persisted across restarts, but the first sample after a restart, gap or untimed sample only starts a new baseline, so downtime never adds energy. If the charger ever sends an export measurand itself, the integration logs a warning and stops deriving. The option is available for OCPP 1.6 only.
 
 Whether this charger reports discharge as negative import has not yet been confirmed on a live V2G session; check the derived sensors against an independent meter before relying on them.

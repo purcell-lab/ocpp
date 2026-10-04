@@ -63,6 +63,7 @@ def _mk_cp(
     entry: MockConfigEntry | None = None,
     connectors: int = 1,
     export_meter_interval: int = 0,
+    export_reference_entity: str = "",
 ) -> ChargePoint:
     entry = entry or _mk_entry(hass)
     hass.data.setdefault(DOMAIN, {})
@@ -78,6 +79,7 @@ def _mk_cp(
         force_smart_charging=False,
         derive_export_from_negative_import=derive,
         export_meter_interval=export_meter_interval,
+        export_reference_entity=export_reference_entity,
     )
     conn = SimpleNamespace(state=State.CLOSED, close=lambda: asyncio.sleep(0))
     cp = ChargePoint(CP_ID, conn, hass, entry, centr, chg)
@@ -851,3 +853,62 @@ async def test_no_interval_changes_unless_enabled(hass, derive, interval):
     await _feed(hass, cp, [(0, -7300), (60, -7300)])
 
     assert sent == []
+
+
+# --------------------------------------------------------------------------
+# Optional reference divergence (diagnostic)
+# --------------------------------------------------------------------------
+
+REF = "sensor.inverter_total_discharging_capacity"
+
+
+async def test_divergence_against_a_reference_in_mwh(hass):
+    """Deltas from the first comparison, with the reference's unit converted."""
+    cp = _mk_cp(hass, export_reference_entity=REF)
+    await _settle(hass, cp)
+
+    hass.states.async_set(REF, "11.06370", {"unit_of_measurement": "MWh"})
+    _send(cp, T0, *_sigen_v2g(-12000))
+    hass.states.async_set(REF, "11.06390", {"unit_of_measurement": "MWh"})
+    _send(cp, T0 + timedelta(seconds=60), *_sigen_v2g(-12000))
+
+    attrs = _m(cp, EAER).extra_attr
+    assert attrs["reference_entity"] == REF
+    assert attrs["reference_status"] == "ok"
+    assert attrs["reference_delta_kwh"] == pytest.approx(0.2)
+    assert attrs["derived_delta_kwh"] == pytest.approx(0.2)
+    assert attrs["divergence_kwh"] == pytest.approx(0.0, abs=1e-6)
+    assert attrs["divergence_pct"] == pytest.approx(0.0, abs=0.01)
+
+
+async def test_reference_never_changes_the_derived_values(hass):
+    """The reference is diagnostic only: same register with or without it."""
+    with_ref = _mk_cp(hass, export_reference_entity=REF)
+    await _settle(hass, with_ref)
+    hass.states.async_set(REF, "999", {"unit_of_measurement": "kWh"})
+    plain = _mk_cp(hass)
+    await _settle(hass, plain)
+    for cp in (with_ref, plain):
+        _send(cp, T0, *_sigen_v2g(-12000))
+        _send(cp, T0 + timedelta(seconds=60), *_sigen_v2g(-9000))
+
+    assert _m(with_ref, EAER).value == _m(plain, EAER).value
+    assert "reference_entity" not in _m(plain, EAER).extra_attr
+
+
+@pytest.mark.parametrize(
+    ("state", "unit"),
+    [("unavailable", "kWh"), ("not a number", "kWh"), ("5", "bananas"), (None, None)],
+)
+async def test_unusable_reference_is_reported_not_guessed(hass, state, unit):
+    """Missing, non-numeric or unconvertible reference: status unavailable."""
+    cp = _mk_cp(hass, export_reference_entity=REF)
+    await _settle(hass, cp)
+    if state is not None:
+        hass.states.async_set(REF, state, {"unit_of_measurement": unit})
+
+    _send(cp, T0, *_sigen_v2g(-12000))
+
+    attrs = _m(cp, EAER).extra_attr
+    assert attrs["reference_status"] == "unavailable"
+    assert "divergence_kwh" not in attrs

@@ -37,6 +37,12 @@ ATTR_LOWER = "energy_lower_bound_kwh"
 ATTR_UPPER = "energy_upper_bound_kwh"
 ATTR_STEPS = "step_intervals"
 ATTR_LAST_INTERVAL = "last_interval_s"
+ATTR_REFERENCE_ENTITY = "reference_entity"
+ATTR_REFERENCE_STATUS = "reference_status"
+ATTR_REFERENCE_DELTA = "reference_delta_kwh"
+ATTR_DERIVED_DELTA = "derived_delta_kwh"
+ATTR_DIVERGENCE = "divergence_kwh"
+ATTR_DIVERGENCE_PCT = "divergence_pct"
 
 # An interval is a "step" when export starts or stops inside it, or power
 # moves by more than this between its two samples. Live V2G data showed the
