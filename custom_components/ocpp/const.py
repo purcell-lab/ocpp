@@ -14,6 +14,7 @@ CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE = "charge_point_max_profile_absolute"
 CONF_CPI = "charge_point_identity"
 CONF_CPID = "cpid"
 CONF_CPIDS = "cpids"
+CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT = "derive_export_from_negative_import"
 CONF_CSID = "csid"
 CONF_ENABLE_HA_NOTIFICATIONS = "enable_ha_notifications"
 CONF_DEFAULT_AUTH_STATUS = "default_authorization_status"
@@ -46,6 +47,7 @@ CONF_WEBSOCKET_PING_INTERVAL = "websocket_ping_interval"
 CONF_WEBSOCKET_PING_TIMEOUT = "websocket_ping_timeout"
 DATA_UPDATED = "ocpp_data_updated"
 DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE = False
+DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT = False
 DEFAULT_CSID = "central"
 DEFAULT_CPID = "charger"
 DEFAULT_ENABLE_HA_NOTIFICATIONS = True
@@ -197,6 +199,9 @@ class ChargerSystemSettings:
     connection: int | None = None  # number of this connection in central server
     num_connectors: int = DEFAULT_NUM_CONNECTORS
     charge_point_max_profile_absolute: bool = DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE
+    derive_export_from_negative_import: bool = (
+        DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT
+    )
 
 
 @dataclass

@@ -188,6 +188,21 @@ but certain features (eg. scheduling) may not work.
 ## [Schneider Electric EVlink Wallbox Plus](https://www.se.com/nl/en/product/EVH3S22P0CK/evlink-wallbox-plus-t2-attached-cable-3-phase-32a-22kw/)
 Model is discontinued by the manufacturer.
 
+## [Sigenergy SigenStor EVDC](https://www.sigenergy.com/) (tested: EVDC 25 7.5S2, firmware V100R001C21SPC117)
+
+Connects over OCPP 1.6 only. The charger answers `MeterValuesSampledData` as an unknown key, so its measurands cannot be configured or auto-detected: switch off measurand auto-detection and select them manually. Each `MeterValues` carries `Energy.Active.Import.Register` (Wh), `Current.Import`, `Voltage`, `Power.Offered`, `Power.Active.Import` (W) and `SoC`. The import register is a charge-only lifetime counter.
+
+### Export (V2G) sensors
+
+The charger sends no `*.Export.*` measurand, so Home Assistant has no export figures by default. Enable **Derive export (V2G) sensors from negative import readings** in the charge point's options to have the integration:
+
+- split a negative `Power.Active.Import` / `Current.Import` into zero import and a positive `Power.Active.Export` / `Current.Export`;
+- integrate the export power over the charger's own sample timestamps (trapezoidal, between samples at most `max(180 s, 3 x meter interval)` apart) into a lifetime `Energy.Active.Export.Register` in kWh.
+
+The derived register is an estimate from instantaneous samples, not a metered counter, and its attributes say so (`source: derived_from_negative_import`, `estimated: true`). It is persisted across restarts, but the first sample after a restart, gap or untimed sample only starts a new baseline, so downtime never adds energy. If the charger ever sends an export measurand itself, the integration logs a warning and stops deriving. The option is available for OCPP 1.6 only.
+
+Whether this charger reports discharge as negative import has not yet been confirmed on a live V2G session; check the derived sensors against an independent meter before relying on them.
+
 ## [Simpson & Partners](https://simpson-partners.com/home-ev-charger/)
 All basic functions work properly
 

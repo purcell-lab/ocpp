@@ -25,9 +25,11 @@ from .api import CentralSystem
 from .const import (
     CONF_CPID,
     CONF_CPIDS,
+    CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
     CONF_NUM_CONNECTORS,
     DATA_UPDATED,
     DEFAULT_CLASS_UNITS_HA,
+    DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
     DEFAULT_NUM_CONNECTORS,
     DOMAIN,
     ICON,
@@ -37,6 +39,13 @@ from .const import (
 from .enums import HAChargerDetails, HAChargerSession, HAChargerStatuses
 
 _LOGGER: logging.Logger = logging.getLogger(__package__)
+
+# Sensors fed by derive_export_from_negative_import.
+DERIVED_EXPORT_MEASURANDS = [
+    Measurand.current_export.value,
+    Measurand.power_active_export.value,
+    Measurand.energy_active_export_register.value,
+]
 
 
 @dataclass
@@ -75,7 +84,15 @@ async def async_setup_entry(hass, entry, async_add_devices):
             if m and m.strip()
         ]
         default_measurands: list[str] = []
-        measurands = sorted(configured or default_measurands)
+        measurands = configured or default_measurands
+        if cp_id_settings.get(
+            CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
+            DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
+        ):
+            # The derived flows need somewhere to land even though the
+            # charger never lists export measurands as supported.
+            measurands = list(dict.fromkeys([*measurands, *DERIVED_EXPORT_MEASURANDS]))
+        measurands = sorted(measurands)
 
         CHARGER_ONLY = [
             HAChargerStatuses.status,
