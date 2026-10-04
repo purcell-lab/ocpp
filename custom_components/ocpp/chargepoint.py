@@ -69,6 +69,7 @@ from .enums import (
     HAChargerStatuses as cstat,
     OcppMisc as om,
     Profiles as prof,
+    ReadingContextSource as ctxsrc,
 )
 
 from .const import (
@@ -1214,6 +1215,9 @@ class ChargePoint(cp):
             self._metrics[(target_cid, measurand)].extra_attr[phase] = value
             if context is not None:
                 self._metrics[(target_cid, measurand)].extra_attr[om.context] = context
+                self._metrics[(target_cid, measurand)].extra_attr[om.context_source] = (
+                    ctxsrc.charger
+                )
 
         line_phases_all = [
             Phase.l1.value,
@@ -1393,6 +1397,11 @@ class ChargePoint(cp):
                 phase = sampled_value.phase
                 location = sampled_value.location
                 context = sampled_value.context or ReadingContext.sample_periodic.value
+                # Published with context so consumers can tell a charger-sent
+                # context from the Sample.Periodic default filled in above.
+                context_source = (
+                    ctxsrc.charger if sampled_value.context else ctxsrc.defaulted
+                )
 
                 # Strip the phase tag ONLY if a single-phase charger sends an isolated L1 energy reading.
                 # If multiple phases exist (e.g., L1, L2), leave them intact so process_phases() can sum them.
@@ -1511,6 +1520,9 @@ class ChargePoint(cp):
                         self._metrics[(target_cid, measurand)].extra_attr[
                             om.context
                         ] = context
+                        self._metrics[(target_cid, measurand)].extra_attr[
+                            om.context_source
+                        ] = context_source
 
                     # Session handling, only for EAIR during a transaction (per-connector)
                     if is_transaction and is_eair:

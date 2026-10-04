@@ -87,6 +87,7 @@ class OcppMisc(StrEnum):
 
     # For pythonic version use .name (eg with kwargs) for ocpp json use .value
     context = "context"
+    context_source = "context_source"
     key = "key"
     limit = "limit"
     location = "location"
@@ -123,6 +124,15 @@ class OcppMisc(StrEnum):
     # for use with Smart Charging
     current = "Current"
     power = "Power"
+
+
+class ReadingContextSource(StrEnum):
+    """Values of the context_source attribute published next to context."""
+
+    # The charger sent a context with the sampled value
+    charger = "charger"
+    # The charger sent none; the integration filled in Sample.Periodic
+    defaulted = "defaulted"
 
 
 class ConfigurationKey(StrEnum):
