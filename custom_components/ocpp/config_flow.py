@@ -16,6 +16,7 @@ from .const import (
     CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
     CONF_CPID,
     CONF_CPIDS,
+    CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
     CONF_CSID,
     CONF_ENABLE_HA_NOTIFICATIONS,
     CONF_FORCE_SMART_CHARGING,
@@ -39,6 +40,7 @@ from .const import (
     DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
     DEFAULT_CPID,
     DEFAULT_CSID,
+    DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
     DEFAULT_ENABLE_HA_NOTIFICATIONS,
     DEFAULT_FORCE_SMART_CHARGING,
     DEFAULT_HOST,
@@ -109,6 +111,10 @@ STEP_USER_CP_DATA_SCHEMA = vol.Schema(
         vol.Required(
             CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
             default=DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
+        ): bool,
+        vol.Required(
+            CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
+            default=DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
         ): bool,
         vol.Required(
             CONF_ENABLE_HA_NOTIFICATIONS, default=DEFAULT_ENABLE_HA_NOTIFICATIONS
@@ -466,6 +472,13 @@ class OCPPOptionsFlow(OptionsFlow):
                     default=current.get(
                         CONF_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
                         DEFAULT_CHARGE_POINT_MAX_PROFILE_ABSOLUTE,
+                    ),
+                ): bool,
+                vol.Required(
+                    CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
+                    default=current.get(
+                        CONF_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
+                        DEFAULT_DERIVE_EXPORT_FROM_NEGATIVE_IMPORT,
                     ),
                 ): bool,
                 vol.Required(

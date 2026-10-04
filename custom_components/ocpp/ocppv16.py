@@ -48,6 +48,7 @@ from .chargepoint import (
     SetVariableResult,
 )
 from .chargepoint import ChargePoint as cp
+from .derived_export import DerivedExportRegister
 
 from .enums import (
     ConfigurationKey as ckey,
@@ -155,6 +156,9 @@ def _allowed_charging_rate_units(units_resp: str | None) -> tuple[bool, bool]:
 class ChargePoint(cp):
     """Server side representation of a charger."""
 
+    # The derived export register is persisted with the transaction state.
+    _supports_derived_export = True
+
     def __init__(
         self,
         id: str,
@@ -250,6 +254,7 @@ class ChargePoint(cp):
             persisted_last = 0
         # Never hand out an id at or below one returned before the restart.
         self._last_tx_id = max(self._last_tx_id, persisted_last)
+        self._restore_derived_export(data.get("derived_export"))
         connectors = data.get("connectors", {})
         if not isinstance(connectors, dict):
             return
@@ -277,6 +282,43 @@ class ChargePoint(cp):
             ):
                 self._set_session_start(conn, started, estimated=False)
 
+    def _restore_derived_export(self, data) -> None:
+        """Adopt persisted derived export registers.
+
+        Only the energy is restored, never the last sample, so the first
+        reading after a restart starts a new baseline instead of bridging the
+        downtime. The registers are kept even while the option is off, so
+        switching it back on continues the total instead of resetting it.
+        """
+        if not isinstance(data, dict):
+            return
+        for key, item in data.items():
+            try:
+                conn = int(key)
+            except (TypeError, ValueError):
+                continue
+            restored = DerivedExportRegister.from_dict(item)
+            if restored is None:
+                continue
+            live = self._derived_export.get(conn)
+            if live is not None:
+                # Samples integrated before the load finished are on top of
+                # the persisted total, not instead of it.
+                live.energy_kwh += restored.energy_kwh
+            else:
+                self._derived_export[conn] = restored
+            if not self._derive_export_enabled():
+                continue
+            metric = self._metrics[
+                (conn, Measurand.energy_active_export_register.value)
+            ]
+            metric.value = round(self._derived_export[conn].energy_kwh, 6)
+            metric.unit = HA_ENERGY_UNIT
+
+    def _on_derived_export_changed(self) -> None:
+        """Persist the derived export register with the transaction state."""
+        self._schedule_tx_store_save()
+
     def _note_transaction_id(self, transaction_id) -> None:
         """Keep allocations clear of an id that is live on some connector.
 
@@ -293,7 +335,7 @@ class ChargePoint(cp):
 
     def _tx_store_snapshot(self) -> dict:
         """Serialise what a restart needs: the last id and running sessions."""
-        return {
+        snapshot = {
             "last_tx_id": int(self._last_tx_id),
             "connectors": {
                 str(conn): {
@@ -304,6 +346,14 @@ class ChargePoint(cp):
                 if tx and conn in self._tx_started_at
             },
         }
+        if self._derived_export:
+            # Only written for chargers that derive export, so the stored
+            # layout is unchanged for everyone else.
+            snapshot["derived_export"] = {
+                str(conn): register.to_dict()
+                for conn, register in self._derived_export.items()
+            }
+        return snapshot
 
     def _schedule_tx_store_save(self) -> None:
         """Persist best-effort: coalesced, and never awaited by a handler."""
@@ -1684,7 +1734,9 @@ class ChargePoint(cp):
             )
 
         meter_values: list[list[MeasurandValue]] = []
+        timestamps: list = []
         for bucket in meter_value:
+            timestamps.append(bucket.get("timestamp"))
             measurands: list[MeasurandValue] = []
             for sampled_value in bucket.get(om.sampled_value.name, []):
                 measurand = sampled_value.get(om.measurand, None)
@@ -1703,7 +1755,9 @@ class ChargePoint(cp):
                 )
             meter_values.append(measurands)
 
-        self.process_measurands(meter_values, transaction_matches, connector_id)
+        self.process_measurands(
+            meter_values, transaction_matches, connector_id, timestamps
+        )
 
         # The closing values are the last thing a charger sends for a session and
         # they still carry the final current and power, so they would otherwise

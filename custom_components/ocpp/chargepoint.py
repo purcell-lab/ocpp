@@ -39,6 +39,19 @@ from ocpp.v201 import call_result as call_resultv201
 from ocpp.messages import CallError
 from ocpp.exceptions import NotImplementedError
 
+from .derived_export import (
+    ATTR_ESTIMATED,
+    ATTR_LAST_SAMPLE,
+    ATTR_MAX_GAP,
+    ATTR_METHOD,
+    ATTR_SOURCE,
+    DERIVED_METHOD,
+    DERIVED_SOURCE,
+    DerivedExportRegister,
+    max_sample_gap,
+    parse_sample_timestamp,
+    split_signed,
+)
 from .enums import (
     HAChargerDetails as cdet,
     HAChargerSession as csess,
@@ -72,6 +85,14 @@ from .const import (
 )
 
 TIME_MINUTES = UnitOfTime.MINUTES
+_NATIVE_EXPORT_MEASURANDS = frozenset(
+    {
+        Measurand.current_export.value,
+        Measurand.power_active_export.value,
+        Measurand.energy_active_export_register.value,
+        Measurand.energy_active_export_interval.value,
+    }
+)
 _LOGGER: logging.Logger = logging.getLogger(__package__)
 
 # Seconds before monitor_connection starts post_connect for chargers that
@@ -307,6 +328,10 @@ class ChargePoint(cp):
         self._reconnect_token = None
         self._retirement_tasks: set[asyncio.Task] = set()
         self._charger_reports_session_energy = False
+        # connector_id -> export energy derived from negative import
+        self._derived_export: dict[int, DerivedExportRegister] = {}
+        # Once the charger sends any export measurand itself, stop deriving.
+        self._native_export_seen = False
 
         # Connector-aware, but backwards compatible:
         self._metrics: _ConnectorAwareMetrics = _ConnectorAwareMetrics()
@@ -1285,10 +1310,15 @@ class ChargePoint(cp):
         meter_values: list[list[MeasurandValue]],
         is_transaction: bool,
         connector_id: int = 0,
+        timestamps: list | None = None,
     ):
-        """Process all values from OCPP 1.6 MeterValues or OCPP 2.0.1 TransactionEvent."""
+        """Process all values from OCPP 1.6 MeterValues or OCPP 2.0.1 TransactionEvent.
 
-        for bucket in meter_values:
+        ``timestamps``, when given, holds each bucket's own sample time and is
+        only used to derive export energy (see ``derived_export``).
+        """
+
+        for bucket_idx, bucket in enumerate(meter_values):
             # --- Preselect best EAIR in this bucket (ignore Transaction.Begin) ---
             best_eair_idx = None
             best_pr = -1
@@ -1509,6 +1539,145 @@ class ChargePoint(cp):
                 self.process_phases(unprocessed, connector_id)
             except TypeError:
                 self.process_phases(unprocessed)
+
+            if self._derive_export_enabled():
+                raw_ts = (
+                    timestamps[bucket_idx]
+                    if timestamps is not None and bucket_idx < len(timestamps)
+                    else None
+                )
+                self._derive_export_from_bucket(bucket, connector_id, raw_ts)
+
+    # ------------------------------------------------------------------
+    # Export derived from negative import (derive_export_from_negative_import)
+    # ------------------------------------------------------------------
+
+    # Set by protocol implementations that persist the derived register.
+    _supports_derived_export = False
+
+    def _derive_export_enabled(self) -> bool:
+        """Return True when this charger should derive export from negative import."""
+        return bool(
+            self._supports_derived_export
+            and getattr(self.settings, "derive_export_from_negative_import", False)
+            and not self._native_export_seen
+        )
+
+    def _derived_export_target(self, bucket, measurand: str, connector_id) -> int:
+        """Return the connector the bucket's readings of ``measurand`` were filed on.
+
+        Mirrors process_measurands: single-phase readings land on the
+        reported connector, per-phase ones on process_phases' target.
+        """
+        for sv in bucket:
+            if sv.measurand == measurand and sv.phase is None:
+                return connector_id
+        try:
+            n_connectors = int(getattr(self, "num_connectors", 1) or 1)
+        except (TypeError, ValueError):
+            n_connectors = 1
+        if connector_id in (None, 0):
+            return 1 if n_connectors == 1 else 0
+        return int(connector_id)
+
+    def _derive_export_from_bucket(self, bucket, connector_id, raw_ts) -> None:
+        """Split signed import flows into import/export and integrate export power."""
+        reported = {sv.measurand for sv in bucket}
+        native = reported & _NATIVE_EXPORT_MEASURANDS
+        if native:
+            # The charger meters export itself; its figures always win, and
+            # mixing them with derived ones would double count.
+            self._native_export_seen = True
+            _LOGGER.warning(
+                "%s reports %s natively; no longer deriving export from "
+                "negative import",
+                self.id,
+                ", ".join(sorted(native)),
+            )
+            return
+
+        pai = Measurand.power_active_import.value
+        cur = Measurand.current_import.value
+        pae = Measurand.power_active_export.value
+        cex = Measurand.current_export.value
+        eaer = Measurand.energy_active_export_register.value
+
+        derived_attrs = {
+            ATTR_SOURCE: DERIVED_SOURCE,
+            ATTR_ESTIMATED: False,
+        }
+
+        if cur in reported:
+            cid = self._derived_export_target(bucket, cur, connector_id)
+            metric = self._metrics[(cid, cur)]
+            if isinstance(metric.value, int | float):
+                imp, exp = split_signed(float(metric.value))
+                metric.value = imp
+                self._metrics[(cid, cex)].value = exp
+                self._metrics[(cid, cex)].unit = metric.unit
+                self._metrics[(cid, cex)].extra_attr.update(derived_attrs)
+                self._metrics[(cid, cex)].extra_attr[om.context] = (
+                    metric.extra_attr.get(om.context)
+                )
+
+        if pai not in reported:
+            return
+        cid = self._derived_export_target(bucket, pai, connector_id)
+        metric = self._metrics[(cid, pai)]
+        if not isinstance(metric.value, int | float):
+            return
+        if metric.unit == HA_POWER_UNIT:
+            signed_kw = float(metric.value)
+        elif metric.unit == DEFAULT_POWER_UNIT:
+            signed_kw = float(metric.value) / 1000.0
+        else:
+            # Without a known unit the sample cannot be integrated safely.
+            return
+        _, export_kw = split_signed(signed_kw)
+        metric.value = max(float(metric.value), 0.0)
+        export_metric = self._metrics[(cid, pae)]
+        export_metric.value = (
+            export_kw if metric.unit == HA_POWER_UNIT else export_kw * 1000.0
+        )
+        export_metric.unit = metric.unit
+        export_metric.extra_attr.update(derived_attrs)
+        export_metric.extra_attr[om.context] = metric.extra_attr.get(om.context)
+
+        ts = parse_sample_timestamp(raw_ts)
+        if ts is None:
+            # The register is only advanced on the charger's own clock; an
+            # untimed sample breaks the chain rather than guessing an interval.
+            self._derived_export_register(cid).reset_baseline()
+            return
+        register = self._derived_export_register(cid)
+        gap = max_sample_gap(getattr(self.settings, "meter_interval", None))
+        added = register.add_sample(ts, export_kw, gap)
+
+        reg_metric = self._metrics[(cid, eaer)]
+        reg_metric.value = round(register.energy_kwh, 6)
+        reg_metric.unit = HA_ENERGY_UNIT
+        reg_metric.extra_attr.update(
+            {
+                ATTR_SOURCE: DERIVED_SOURCE,
+                ATTR_METHOD: DERIVED_METHOD,
+                ATTR_ESTIMATED: True,
+                ATTR_MAX_GAP: gap,
+                ATTR_LAST_SAMPLE: ts.isoformat(),
+            }
+        )
+        if added > 0:
+            self._on_derived_export_changed()
+
+    def _derived_export_register(self, cid: int) -> DerivedExportRegister:
+        """Return the connector's derived export register, creating it if needed."""
+        register = self._derived_export.get(cid)
+        if register is None:
+            register = DerivedExportRegister()
+            self._derived_export[cid] = register
+        return register
+
+    def _on_derived_export_changed(self) -> None:
+        """Persist the derived register; protocol implementations override."""
 
     @property
     def supported_features(self) -> int:
