@@ -14,6 +14,7 @@ for HACS and is the only branch that carries fork-only changes.
 | `fix/restore-metrics-in-native-unit` | Meter Start restored after a restart is converted from the HA display unit (e.g. MWh) instead of being read as kWh. | new issue |
 | `fix/v16-stop-after-finishing` | A session lost across an HA restart is still matched to its StopTransaction from the persisted transaction store; connector 0 no longer shadows connector 1 on the flat Transaction Id sensor. The live failure that prompted it is not fully explained yet: confirm with debug logging on the next remote stop. | new issue |
 | `fix/device-registry-deprecations` | Devices linked with `via_device_id` instead of the deprecated `via_device` tuple (breaks in HA 2027.8); `update()` no longer reads `device_registry.devices` as a mapping (breaks in 2027.9). | new issue (purcell-lab/ocpp#2) |
+| `fix/quiet-shutdown-connection-errors` | A charger message arriving while HA shuts down ("Executor shutdown has been called") is logged at debug instead of as an error with a traceback on every restart. | new issue |
 | `feat/measurand-context-source` | `context_source: charger / defaulted` next to every published `context`. | new issue |
 
 ## Stacked V2G export series (merge in this order)
@@ -27,6 +28,7 @@ Each branch builds on the one above it.
 5. `feat/derived-export-uncertainty`: lower and upper bounds, step-interval count and last interval on the register.
 6. `feat/adaptive-export-sample-interval`: fast `MeterValueSampleInterval` (default 10 s) while exporting, released afterwards.
 7. `feat/export-reference-divergence`: optional reference entity, divergence attributes only.
+8. `fix/derived-export-session-boundary`: StartTransaction / StopTransaction break the integration chain, so a session's first sample never integrates back to the previous session's last one (live: 0.027 kWh of idle car-swap time credited to the next session). Fold into `feat/derived-export-from-negative-import` / `feat/session-export-energy` when upstreaming.
 
 ## Fork-only changes (install branch only, never upstream)
 
