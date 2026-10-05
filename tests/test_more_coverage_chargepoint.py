@@ -2,8 +2,10 @@
 
 import asyncio
 import contextlib
+import logging
 from types import SimpleNamespace
 
+from homeassistant.core import CoreState
 import pytest
 import websockets
 from websockets.protocol import State
@@ -139,7 +141,7 @@ async def test_handle_call_notimplemented_sends_call_error(
 @pytest.mark.parametrize("cp_id", ["CP_cov_run_paths"])
 @pytest.mark.parametrize("port", [9414])
 async def test_run_handles_timeout_and_other_exception(
-    hass, socket_enabled, cp_id, port, setup_config_entry, monkeypatch
+    hass, socket_enabled, cp_id, port, setup_config_entry, monkeypatch, caplog
 ):
     """Covers 537 and 540–541: run() swallows TimeoutError and logs other exceptions, then stops."""
     cs = setup_config_entry
@@ -182,8 +184,29 @@ async def test_run_handles_timeout_and_other_exception(
             assert stopped["count"] >= 1
 
             # Other exception path -> should be logged via L540–541 and then stop() called again.
+            caplog.clear()
             await srv.run([raises_other()])
             assert stopped["count"] >= 2
+            assert any(
+                r.levelno == logging.ERROR and "Unexpected exception" in r.getMessage()
+                for r in caplog.records
+            )
+
+            # The same failure while Home Assistant shuts down (the executor
+            # is gone) is expected: logged at debug, not as an error.
+            caplog.clear()
+            caplog.set_level(logging.DEBUG, logger="custom_components.ocpp")
+            hass.set_state(CoreState.stopping)
+            try:
+                await srv.run([raises_other()])
+            finally:
+                hass.set_state(CoreState.running)
+            assert stopped["count"] >= 3
+            assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+            assert any(
+                "during Home Assistant shutdown" in r.getMessage()
+                for r in caplog.records
+            )
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
