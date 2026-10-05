@@ -2063,6 +2063,7 @@ class ChargePoint(cp):
             self._metrics[(connector_id, csess.session_energy)].value = 0.0
             self._metrics[(connector_id, csess.session_energy)].unit = HA_ENERGY_UNIT
             self._reset_session_export(connector_id)
+            self._break_export_chain(connector_id)
 
             self._schedule_tx_store_save()
             self._report_transaction_start(connector_id, tx_id, connector_id)
@@ -2092,6 +2093,8 @@ class ChargePoint(cp):
             # instead: its timer stops advancing and the next status report
             # from the charger settles it.
             live = self._live_connectors()
+            for cid in live:
+                self._break_export_chain(cid)
             if live:
                 self._tx_indeterminate.update(live)
                 # Keep the stop's payload for whichever of them ended.
@@ -2133,6 +2136,7 @@ class ChargePoint(cp):
         )
         self.active_transaction_id = 0
         self._apply_stop_energy(conn, meter_stop)
+        self._break_export_chain(conn)
 
         self._zero_flow_measurands(conn)
         self._release_export_interval()

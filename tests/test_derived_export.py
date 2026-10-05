@@ -628,15 +628,50 @@ async def test_session_export_counts_only_this_transaction(hass):
     tx = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
     assert _m(cp, SESSION_EXPORT).value == 0.0
 
+    # The start is a boundary: the first sample inside the session is only a
+    # baseline, so the interval spanning the start is billed to nobody.
     _send_tx(cp, tx, T0 + timedelta(seconds=120), *_sigen_v2g(-12000))
     _send_tx(cp, tx, T0 + timedelta(seconds=180), *_sigen_v2g(-12000))
-    assert _m(cp, SESSION_EXPORT).value == pytest.approx(0.4)
+    assert _m(cp, SESSION_EXPORT).value == pytest.approx(0.2)
     assert _m(cp, SESSION_EXPORT).extra_attr["estimated"] is True
-    assert _m(cp, EAER).value == pytest.approx(0.6)
+    assert _m(cp, EAER).value == pytest.approx(0.4)
 
     second = cp.on_start_transaction(1, "tag", 15_000_000).transaction_id
     assert second != tx
     assert _m(cp, SESSION_EXPORT).value == 0.0
+
+
+async def test_back_to_back_sessions_do_not_bridge(hass):
+    """Replay of a live car swap: session 2 starts at zero export.
+
+    Session 1 ended at ~2 kW, the connector was idle while the cars were
+    swapped, and session 2's first sample (0.2 kW) came 89 s after session
+    1's last one - inside the gap limit. Integrating across that interval
+    credited ~0.027 kWh of idle time to session 2 and the lifetime register.
+    """
+    cp = _mk_cp(hass)
+    await _settle(hass, cp)
+
+    first = cp.on_start_transaction(1, "car-a", 15_000_000).transaction_id
+    _send_tx(cp, first, T0, *_sigen_v2g(-2018))
+    _send_tx(cp, first, T0 + timedelta(seconds=60), *_sigen_v2g(-2027))
+    register_at_stop = _m(cp, EAER).value
+    cp.on_stop_transaction(
+        meter_stop=15_000_000,
+        timestamp=(T0 + timedelta(seconds=79)).isoformat(),
+        transaction_id=first,
+    )
+
+    second = cp.on_start_transaction(1, "car-b", 15_000_000).transaction_id
+    _send_tx(cp, second, T0 + timedelta(seconds=149), *_sigen_v2g(-200))
+    assert _m(cp, SESSION_EXPORT).value == 0.0
+    assert _m(cp, EAER).value == pytest.approx(register_at_stop)
+
+    # From its own second sample on, session 2 integrates normally.
+    _send_tx(cp, second, T0 + timedelta(seconds=209), *_sigen_v2g(-2051))
+    assert _m(cp, SESSION_EXPORT).value == pytest.approx(
+        (0.2 + 2.051) / 2 / 60, abs=1e-6
+    )
 
 
 async def test_session_export_survives_a_restart_of_the_same_session(
