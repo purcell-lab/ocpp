@@ -709,10 +709,21 @@ class ChargePoint(cp):
         except WebSocketException as websocket_exception:
             _LOGGER.debug(f"Connection closed to '{self.id}': {websocket_exception}")
         except Exception as other_exception:
-            _LOGGER.error(
-                f"Unexpected exception in connection to '{self.id}': '{other_exception}'",
-                exc_info=True,
-            )
+            if self.hass.is_stopping:
+                # A charger message that arrives while Home Assistant shuts
+                # down fails once the executor is gone ("Executor shutdown has
+                # been called"). Expected: the charger resends unanswered
+                # calls on reconnect, so it is not worth an error per restart.
+                _LOGGER.debug(
+                    "Connection to '%s' ended during Home Assistant shutdown: %s",
+                    self.id,
+                    other_exception,
+                )
+            else:
+                _LOGGER.error(
+                    f"Unexpected exception in connection to '{self.id}': '{other_exception}'",
+                    exc_info=True,
+                )
         finally:
             await self._stop_session(session)
 
