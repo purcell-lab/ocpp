@@ -2058,6 +2058,18 @@ class ChargePoint(cp):
         self._derived_session_export[cid] = 0.0
         self._set_session_export(cid, 0.0)
 
+    def _break_export_chain(self, cid: int) -> None:
+        """Mark a transaction boundary on the connector's derived register.
+
+        The next sample must not integrate back to the one before the
+        boundary: between a stop and the next start the charger is idle (or a
+        different vehicle is connected), so the trapezoid would invent energy
+        and file it under the new session.
+        """
+        register = self._derived_export.get(cid)
+        if register is not None:
+            register.reset_baseline()
+
     def _set_derived_current(self, cid: int, amps: float, source, *, estimated: bool):
         """Publish Current.Export, labelled with how it was obtained."""
         cex = self._metrics[(cid, Measurand.current_export.value)]
